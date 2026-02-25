@@ -1198,6 +1198,9 @@ def _replace_active_groups(
     function together.  Pass all-``None`` to tear down without replacement.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
+    if _WORLD is not None:
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=_WORLD.cpu_group)
     for group in (_DP, _EP, _WORLD, _EPLB):
         if group is not None:
             group.destroy()
