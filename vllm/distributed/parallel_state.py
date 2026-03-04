@@ -40,7 +40,7 @@ import torch
 import torch.distributed
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
-from torch.distributed import Backend, ProcessGroup
+from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -1162,10 +1162,11 @@ def init_model_parallel_group(
 def _init_stateless_group(
     group_ranks: list[list[int]],
     group_name: str,
-    group_ports: list[list[int]],
     host: str,
     backend: str,
     use_device_communicator: bool = True,
+    group_ports: list[list[int]] | None = None,
+    coord_store: Store | None = None,
 ) -> "StatelessGroupCoordinator":
     """Create a StatelessGroupCoordinator with the given parameters."""
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
@@ -1179,6 +1180,7 @@ def _init_stateless_group(
         group_name=group_name,
         host=host,
         group_ports=group_ports,
+        coord_store=coord_store,
         global_rank=world.rank,
         global_world_size=world.world_size,
     )
@@ -1308,6 +1310,8 @@ def set_custom_all_reduce(enable: bool):
 def _init_elastic_ep_world(
     config, local_rank: int, backend: str, rank: int, world_size: int
 ) -> None:
+    from torch.distributed import TCPStore
+
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
     global _WORLD, _NODE_COUNT
@@ -1319,7 +1323,12 @@ def _init_elastic_ep_world(
     group_ranks = [all_ranks[i : i + 1] for i in range(global_world_size)]
     if global_rank in all_ranks:
         group_ranks = [all_ranks]
-    group_ports = [parallel_config.get_next_stateless_world_group_port()]
+    coord_store = TCPStore(
+        host_name=parallel_config.data_parallel_master_ip,
+        port=parallel_config._eep_coord_store_port,
+        is_master=False,
+        wait_for_workers=False,
+    )
     world = StatelessGroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1327,7 +1336,7 @@ def _init_elastic_ep_world(
         use_device_communicator=False,
         group_name="world",
         host=parallel_config.data_parallel_master_ip,
-        group_ports=group_ports,
+        coord_store=coord_store,
         global_rank=global_rank,
         global_world_size=global_world_size,
     )
@@ -1632,15 +1641,20 @@ def initialize_model_parallel(
     group_ranks = [x.tolist() for x in group_ranks]
     if enable_elastic_ep:
         parallel_config = config.parallel_config
-        dp_ports = [
-            parallel_config.get_next_stateless_dp_group_port() for _ in group_ranks
-        ]
+        from torch.distributed import TCPStore as _TCPStore
+
+        _eep_store = _TCPStore(
+            host_name=parallel_config.data_parallel_master_ip,
+            port=parallel_config._eep_coord_store_port,
+            is_master=False,
+            wait_for_workers=False,
+        )
         _DP = _init_stateless_group(
             group_ranks,
             "dp",
-            dp_ports,
             parallel_config.data_parallel_master_ip,
             backend,
+            coord_store=_eep_store,
         )
     else:
         _DP = init_model_parallel_group(
@@ -1663,16 +1677,12 @@ def initialize_model_parallel(
         )
         group_ranks = [x.tolist() for x in group_ranks]
         if enable_elastic_ep:
-            parallel_config = config.parallel_config
-            ep_ports = [
-                parallel_config.get_next_stateless_ep_group_port() for _ in group_ranks
-            ]
             _EP = _init_stateless_group(
                 group_ranks,
                 "ep",
-                ep_ports,
                 parallel_config.data_parallel_master_ip,
                 backend,
+                coord_store=_eep_store,
             )
         else:
             _EP = init_model_parallel_group(
@@ -1691,16 +1701,12 @@ def initialize_model_parallel(
             and config.parallel_config.enable_eplb
         ):
             if enable_elastic_ep:
-                eplb_ports = [
-                    parallel_config.get_next_stateless_eplb_group_port()
-                    for _ in group_ranks
-                ]
                 _EPLB = _init_stateless_group(
                     group_ranks,
                     "eplb",
-                    eplb_ports,
                     parallel_config.data_parallel_master_ip,
                     backend,
+                    coord_store=_eep_store,
                 )
             else:
                 _EPLB = init_model_parallel_group(

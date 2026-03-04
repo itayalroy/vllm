@@ -277,7 +277,15 @@ class CoreEngineActorManager:
         else:
             ray.init()
 
-        vllm_config.parallel_config.allocate_elastic_ep_ports()
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep:
+            from vllm.distributed.utils import create_eep_coord_store
+
+            ip = parallel_config.data_parallel_master_ip
+            store, sock, port = create_eep_coord_store(ip)
+            parallel_config._eep_coord_store_port = port
+            self._eep_coord_store = store
+            self._eep_coord_store_socket = sock
 
         if placement_groups is not None:
             assert local_dp_ranks is not None, (
