@@ -419,6 +419,7 @@ class StatelessProcessGroup:
         world_size: int,
         data_expiration_seconds: int = 3600,
         store_timeout: int = 300,
+        listen_socket=None,
     ) -> "StatelessProcessGroup":
         """A replacement for `torch.distributed.init_process_group` that does not
         pollute the global state.
@@ -437,11 +438,11 @@ class StatelessProcessGroup:
         """  # noqa
         launch_server = rank == 0
         if launch_server:
-            # listen on the specified interface (instead of 0.0.0.0)
-            listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listen_socket.bind((host, port))
-            listen_socket.listen()
+            if listen_socket is None:
+                listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listen_socket.bind((host, port))
+                listen_socket.listen()
             listen_fd = listen_socket.fileno()
         else:
             listen_socket = None
@@ -464,6 +465,35 @@ class StatelessProcessGroup:
             socket=listen_socket,
             data_expiration_seconds=data_expiration_seconds,
         )
+
+
+def create_eep_coord_store(
+    host: str,
+) -> tuple[TCPStore, socket.socket, int]:
+    """Create a TCPStore for EEP port coordination.
+
+    The API server calls this once per scaling event.  Workers connect as
+    clients and use the store to exchange self-picked ports.  The socket
+    is bound and handed to TCPStore via ``master_listen_fd`` so there is
+    zero TOCTOU for the store's own port.
+
+    Returns ``(store, listen_socket, port)``.  The caller **must** hold
+    references to both the store and the socket for the store's lifetime.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, 0))
+    s.listen()
+    port = s.getsockname()[1]
+    store = TCPStore(
+        host_name=host,
+        port=port,
+        is_master=True,
+        world_size=-1,
+        wait_for_workers=False,
+        master_listen_fd=s.fileno(),
+    )
+    return store, s, port
 
 
 def init_gloo_process_group(
@@ -504,6 +534,7 @@ def stateless_init_torch_distributed_process_group(
     backend: str,
     group_name: str | None = None,
     return_store: bool = False,
+    master_listen_fd: int | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
     A replacement for `torch.distributed.init_process_group` that does not
@@ -535,14 +566,30 @@ def stateless_init_torch_distributed_process_group(
     are the same as process 1 and 5, the main communication channel is
     always formed with process 1, 2, ..., 8, and the additional communication
     channel is formed with process 9 and 10.
+
+    When *master_listen_fd* is provided, the rendezvous step
+    is skipped and a ``TCPStore`` server is created directly using the
+    pre-bound socket.  This eliminates the TOCTOU race between port
+    allocation and binding.
     """
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     timeout = _get_default_timeout(backend)
 
-    store, rank, world_size = next(
-        rendezvous(init_method, rank, world_size, timeout=timeout)
-    )
+    if master_listen_fd is not None:
+        store = TCPStore(
+            host_name=host,
+            port=port,
+            world_size=world_size,
+            is_master=True,
+            timeout=timeout,
+            master_listen_fd=master_listen_fd,
+            multi_tenant=True,
+        )
+    else:
+        store, rank, world_size = next(
+            rendezvous(init_method, rank, world_size, timeout=timeout)
+        )
     store.set_timeout(timeout)
 
     group_rank = rank
