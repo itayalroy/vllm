@@ -325,6 +325,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def destroy(self):
         if self.pynccl_comm is not None:
+            # A dummy all-reduce flushes the NCCL proxy thread state left by
+            # grouped broadcast/reduce ops (all_gatherv / reduce_scatterv).
+            # Without this, ncclCommDestroy deadlocks in ncclCommPollCallbacks
+            # because the proxy service never processes the finalize callback.
+            flush = torch.zeros(1, device=self.device)
+            self.pynccl_comm.all_reduce(flush)
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
         if self.ca_comm is not None:
