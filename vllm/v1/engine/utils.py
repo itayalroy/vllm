@@ -279,13 +279,13 @@ class CoreEngineActorManager:
 
         parallel_config = vllm_config.parallel_config
         if parallel_config.enable_elastic_ep:
-            from vllm.distributed.utils import create_eep_coord_store
+            from vllm.distributed.utils import create_coord_store
 
             ip = parallel_config.data_parallel_master_ip
-            store, sock, port = create_eep_coord_store(ip)
-            parallel_config._eep_coord_store_port = port
-            self._eep_coord_store = store
-            self._eep_coord_store_socket = sock
+            store, sock, port = create_coord_store(ip)
+            parallel_config._coord_store_port = port
+            self._coord_store = store
+            self._coord_store_socket = sock
 
         if placement_groups is not None:
             assert local_dp_ranks is not None, (

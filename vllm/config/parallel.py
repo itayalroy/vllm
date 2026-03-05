@@ -249,8 +249,8 @@ class ParallelConfig:
     Set to be private as it's not intended to be configured by users.
     """
 
-    _eep_coord_store_port: int = 0
-    """Port of the EEP coordination TCPStore.  Set by the API server; workers
+    _coord_store_port: int = 0
+    """Port of the coordination TCPStore. Can be set by the API server; workers
     connect as clients to exchange self-picked group ports at runtime."""
 
     decode_context_parallel_size: int = 1
@@ -411,6 +411,40 @@ class ParallelConfig:
 
         return answer
 
+    def _pick_dp_port(self) -> tuple[int, int | None]:
+        """Return ``(port, master_listen_fd)`` for DP group init.
+
+        With a coord store, rank 0 binds a socket and publishes the port;
+        others read it.  Without one, pops a pre-allocated port and
+        returns ``fd=None``.
+        """
+        if not self._coord_store_port:
+            return self.get_next_dp_init_port(), None
+
+        import socket as _socket
+
+        from torch.distributed import TCPStore
+
+        store = TCPStore(
+            host_name=self.data_parallel_master_ip,
+            port=self._coord_store_port,
+            is_master=False,
+            wait_for_workers=False,
+        )
+        key = "dp_master_port"
+        if self.data_parallel_rank == 0:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            s.bind((self.data_parallel_master_ip, 0))
+            s.listen()
+            port = s.getsockname()[1]
+            store.set(key, str(port).encode())
+            fd = s.fileno()
+            s.detach()
+            return port, fd
+        else:
+            return int(store.get(key).decode()), None
+
     def stateless_init_dp_group(self, return_store: bool = False) -> ProcessGroup:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -429,14 +463,16 @@ class ParallelConfig:
         last_exc: Exception | None = None
         for _ in range(max_retries):
             try:
+                port, fd = self._pick_dp_port()
                 # use gloo since the engine process might not have cuda device
                 return stateless_init_torch_distributed_process_group(
                     self.data_parallel_master_ip,
-                    self.get_next_dp_init_port(),
+                    port,
                     self.data_parallel_rank,
                     self.data_parallel_size,
                     backend="gloo",
                     return_store=return_store,
+                    master_listen_fd=fd,
                 )
             except DistNetworkError as e:
                 # We only want to retry when the root cause is EADDRINUSE.

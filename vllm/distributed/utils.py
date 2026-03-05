@@ -467,10 +467,10 @@ class StatelessProcessGroup:
         )
 
 
-def create_eep_coord_store(
+def create_coord_store(
     host: str,
 ) -> tuple[TCPStore, socket.socket, int]:
-    """Create a TCPStore for EEP port coordination.
+    """Create a TCPStore for port coordination.
 
     The API server calls this once per scaling event.  Workers connect as
     clients and use the store to exchange self-picked ports.  The socket

@@ -1488,7 +1488,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
 
         parallel_config = self.vllm_config.parallel_config
-        from vllm.distributed.utils import create_eep_coord_store
+        from vllm.distributed.utils import create_coord_store
         from vllm.utils.network_utils import get_open_ports_list
 
         parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
@@ -1496,10 +1496,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             parallel_config._data_parallel_master_port_list.pop()
         )
         ip = parallel_config.data_parallel_master_ip
-        store, sock, eep_port = create_eep_coord_store(ip)
-        parallel_config._eep_coord_store_port = eep_port
-        self._eep_coord_store = store
-        self._eep_coord_store_socket = sock
+        store, sock, eep_port = create_coord_store(ip)
+        parallel_config._coord_store_port = eep_port
+        self._coord_store = store
+        self._coord_store_socket = sock
 
         # Phase 1: Send reconfig messages to existing engines
         reconfig_futures = []
@@ -1511,7 +1511,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 new_data_parallel_master_ip=ip,
                 new_data_parallel_master_port=parallel_config.data_parallel_master_port,
                 new_data_parallel_master_port_list=parallel_config._data_parallel_master_port_list,
-                eep_coord_store_port=eep_port,
+                coord_store_port=eep_port,
             )
             coro = self._call_utility_async(
                 "reinitialize_distributed", reconfig_request, engine=engine
@@ -1591,7 +1591,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
 
         parallel_config = self.vllm_config.parallel_config
-        from vllm.distributed.utils import create_eep_coord_store
+        from vllm.distributed.utils import create_coord_store
         from vllm.utils.network_utils import get_open_ports_list
 
         parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
@@ -1599,10 +1599,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             parallel_config._data_parallel_master_port_list.pop()
         )
         ip = parallel_config.data_parallel_master_ip
-        store, sock, eep_port = create_eep_coord_store(ip)
-        parallel_config._eep_coord_store_port = eep_port
-        self._eep_coord_store = store
-        self._eep_coord_store_socket = sock
+        store, sock, eep_port = create_coord_store(ip)
+        parallel_config._coord_store_port = eep_port
+        self._coord_store = store
+        self._coord_store_socket = sock
 
         reconfig_futures = []
         for cur_dp_rank, engine in enumerate(self.core_engines):
@@ -1613,7 +1613,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 new_data_parallel_master_ip=ip,
                 new_data_parallel_master_port=parallel_config.data_parallel_master_port,
                 new_data_parallel_master_port_list=parallel_config._data_parallel_master_port_list,
-                eep_coord_store_port=eep_port,
+                coord_store_port=eep_port,
             )
             if cur_dp_rank >= new_data_parallel_size:
                 reconfig_request.new_data_parallel_rank = (

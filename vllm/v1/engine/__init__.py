@@ -247,7 +247,7 @@ class ReconfigureDistributedRequest(msgspec.Struct):
     new_data_parallel_master_ip: str
     new_data_parallel_master_port: int
     new_data_parallel_master_port_list: list[int]
-    eep_coord_store_port: int
+    coord_store_port: int
 
 
 class ReconfigureRankType(enum.IntEnum):

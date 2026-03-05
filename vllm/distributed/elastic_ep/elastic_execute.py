@@ -162,7 +162,7 @@ class ElasticEPScalingExecutor:
                 new_dp_size=new_dp_size,
                 new_world_size_across_dp=new_world_size_across_dp,
                 master_ip=reconfig_request.new_data_parallel_master_ip,
-                coord_store_port=reconfig_request.eep_coord_store_port,
+                coord_store_port=reconfig_request.coord_store_port,
                 enable_eplb=updated_config.parallel_config.enable_eplb,
             )
         self.worker.model_runner.eep_eplb_suppressed = True

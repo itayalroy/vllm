@@ -1325,7 +1325,7 @@ def _init_elastic_ep_world(
         group_ranks = [all_ranks]
     coord_store = TCPStore(
         host_name=parallel_config.data_parallel_master_ip,
-        port=parallel_config._eep_coord_store_port,
+        port=parallel_config._coord_store_port,
         is_master=False,
         wait_for_workers=False,
     )
@@ -1645,7 +1645,7 @@ def initialize_model_parallel(
 
         _eep_store = _TCPStore(
             host_name=parallel_config.data_parallel_master_ip,
-            port=parallel_config._eep_coord_store_port,
+            port=parallel_config._coord_store_port,
             is_master=False,
             wait_for_workers=False,
         )
