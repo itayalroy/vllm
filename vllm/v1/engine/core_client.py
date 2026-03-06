@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import multiprocessing
+import os
 import queue
 import sys
 import uuid
@@ -1676,6 +1677,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # here we don't actually need to wait for the setup switch to complete.
         # We may want to remove it in the future.
         await wait_future
+        if os.environ.get("VLLM_EEP_INVALIDATE_KV_CACHE_ON_SCALE_DOWN") == "1":
+            # POC: invalidate prefix KV state so subsequent decode recomputes
+            # from prompts instead of reusing potentially stale post-reconfig
+            # blocks.
+            reset_ok = await self.call_utility_async(
+                "reset_prefix_cache",
+                True,  # reset_running_requests
+                True,  # reset_connector
+            )
+            logger.info(
+                "[Elastic EP][Debug] reset_prefix_cache after scale-down "
+                "requested, success=%s",
+                reset_ok,
+            )
         logger.info(
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
