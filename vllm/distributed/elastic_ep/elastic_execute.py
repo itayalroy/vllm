@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import gc
+import os
 import weakref
 from collections.abc import Iterable, Sequence
 
@@ -36,11 +37,18 @@ from vllm.distributed.parallel_state import (
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.layer import FusedMoEParallelConfig
+from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 logger = init_logger(__name__)
+_ELASTIC_EP_DEBUG_MEM_ENV = "VLLM_ELASTIC_EP_DEBUG_MEM"
+
+
+def _elastic_ep_debug_mem_enabled() -> bool:
+    value = os.getenv(_ELASTIC_EP_DEBUG_MEM_ENV, "")
+    return value.lower() not in ("", "0", "false", "off", "no")
 
 
 def batch_transfer_weights(
@@ -145,6 +153,126 @@ class ElasticEPScalingExecutor:
             raise ValueError(f"Unknown execute method: {execute_method}")
         return method(*args, **kwargs)
 
+    @staticmethod
+    def _safe_get_group(group_getter):
+        try:
+            return group_getter()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _describe_group(group) -> str:
+        if group is None:
+            return "none"
+
+        rank = "unknown"
+        for attr_name in ("rank_in_group", "rank"):
+            value = getattr(group, attr_name, None)
+            if value is None:
+                continue
+            try:
+                rank = value() if callable(value) else value
+            except Exception:
+                rank = "error"
+            break
+
+        size = "unknown"
+        for attr_name in ("world_size", "size"):
+            value = getattr(group, attr_name, None)
+            if value is None:
+                continue
+            try:
+                size = value() if callable(value) else value
+            except Exception:
+                size = "error"
+            break
+
+        return f"{rank}/{size}"
+
+    @staticmethod
+    def _format_requested_rank(rank: int) -> str:
+        if rank == ReconfigureRankType.KEEP_CURRENT_RANK:
+            return "KEEP_CURRENT_RANK"
+        if rank == ReconfigureRankType.SHUTDOWN_CURRENT_RANK:
+            return "SHUTDOWN_CURRENT_RANK"
+        return str(rank)
+
+    def _reconfig_role(self) -> str:
+        reconfig_request = self.reconfig_request
+        if reconfig_request is None:
+            return "steady_state"
+
+        requested_rank = reconfig_request.new_data_parallel_rank
+        if requested_rank == ReconfigureRankType.SHUTDOWN_CURRENT_RANK:
+            return "removing_rank"
+        if requested_rank != ReconfigureRankType.KEEP_CURRENT_RANK:
+            return "new_rank"
+
+        active_dp_group = self._safe_get_group(get_dp_group)
+        old_dp_size = getattr(active_dp_group, "world_size", None)
+        if old_dp_size is None:
+            return "surviving_rank"
+        if reconfig_request.new_data_parallel_size > old_dp_size:
+            return "surviving_rank_scale_up"
+        if reconfig_request.new_data_parallel_size < old_dp_size:
+            return "surviving_rank_scale_down"
+        return "surviving_rank"
+
+    def _log_debug_memory(self, stage: str, **extra) -> None:
+        if not _elastic_ep_debug_mem_enabled():
+            return
+
+        parallel_config = self.worker.vllm_config.parallel_config
+        reconfig_request = self.reconfig_request
+        fields: dict[str, object] = {
+            "stage": stage,
+            "pid": os.getpid(),
+            "role": self._reconfig_role(),
+            "device": self.worker.device,
+            "device_index": getattr(self.worker.device, "index", None),
+            "config_dp_rank": parallel_config.data_parallel_rank,
+            "config_dp_size": parallel_config.data_parallel_size,
+            "config_dp_rank_local": parallel_config.data_parallel_rank_local,
+            "active_dp": self._describe_group(self._safe_get_group(get_dp_group)),
+            "active_ep": self._describe_group(self._safe_get_group(get_ep_group)),
+            "standby_dp": self._describe_group(
+                self._safe_get_group(get_standby_dp_group)
+            ),
+            "standby_ep": self._describe_group(
+                self._safe_get_group(get_standby_ep_group)
+            ),
+        }
+        if reconfig_request is not None:
+            fields.update(
+                requested_dp_size=reconfig_request.new_data_parallel_size,
+                requested_dp_rank=self._format_requested_rank(
+                    reconfig_request.new_data_parallel_rank
+                ),
+                requested_dp_rank_local=self._format_requested_rank(
+                    reconfig_request.new_data_parallel_rank_local
+                ),
+            )
+
+        try:
+            snapshot = MemorySnapshot(device=self.worker.device)
+        except Exception as exc:
+            fields["snapshot_error"] = type(exc).__name__
+        else:
+            fields.update(
+                free_gib=f"{format_gib(snapshot.free_memory)}GiB",
+                total_gib=f"{format_gib(snapshot.total_memory)}GiB",
+                cuda_used_gib=f"{format_gib(snapshot.cuda_memory)}GiB",
+                torch_reserved_gib=f"{format_gib(snapshot.torch_memory)}GiB",
+                non_torch_gib=f"{format_gib(snapshot.non_torch_memory)}GiB",
+                torch_peak_gib=f"{format_gib(snapshot.torch_peak)}GiB",
+            )
+
+        fields.update({key: value for key, value in extra.items() if value is not None})
+        logger.info(
+            "[Elastic EP][DebugMem] %s",
+            " ".join(f"{key}={value}" for key, value in fields.items()),
+        )
+
     def _set_eplb_suppressed(self, suppressed: bool) -> None:
         self.worker.model_runner.eep_eplb_suppressed = suppressed
         ep_group = get_standby_ep_group() or get_ep_group()
@@ -155,6 +283,7 @@ class ElasticEPScalingExecutor:
             )
 
     def load_model(self) -> None:
+        self._log_debug_memory("load_model_start")
         (
             expanded_physical_to_logical,
             num_logical_experts,
@@ -169,6 +298,12 @@ class ElasticEPScalingExecutor:
             expanded_physical_to_logical, old_num_physical_experts
         )
         self._set_eplb_suppressed(True)
+        self._log_debug_memory(
+            "load_model_done",
+            num_logical_experts=num_logical_experts,
+            old_num_physical_experts=old_num_physical_experts,
+            new_num_physical_experts=expanded_physical_to_logical.shape[1],
+        )
 
     def create_standby_groups(
         self, reconfig_request: ReconfigureDistributedRequest
@@ -176,6 +311,11 @@ class ElasticEPScalingExecutor:
         self.reconfig_request = reconfig_request
         new_dp_size = reconfig_request.new_data_parallel_size
         old_dp_size = get_dp_group().world_size
+        self._log_debug_memory(
+            "create_standby_groups_start",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+        )
         world_size = self.worker.vllm_config.parallel_config.world_size
         new_world_size_across_dp = world_size * new_dp_size
         updated_config = copy.copy(self.worker.vllm_config)
@@ -195,8 +335,18 @@ class ElasticEPScalingExecutor:
             )
         if new_dp_size > old_dp_size:
             self._set_eplb_suppressed(True)
+        self._log_debug_memory(
+            "create_standby_groups_done",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+        )
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
+        self._log_debug_memory(
+            "transfer_weights_start",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+        )
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
         # Broadcast old_dp_size to all workers in standby group
@@ -241,6 +391,12 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
+        self._log_debug_memory(
+            "transfer_weights_done",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+            num_receivers=len(ranks_to_send),
+        )
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -279,15 +435,33 @@ class ElasticEPScalingExecutor:
         torch.accelerator.empty_cache()
 
     def switch_and_remove(self) -> None:
+        self._log_debug_memory("switch_and_remove_before_release")
         self._release_cuda_graphs()
+        self._log_debug_memory("switch_and_remove_after_release")
         _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        self._log_debug_memory("switch_and_remove_after_drop_groups")
 
     def switch_and_prepare(self) -> None:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
+        self._log_debug_memory(
+            "switch_and_prepare_before_release",
+            old_dp_size=old_dp_size,
+            old_ep_size=old_ep_size,
+        )
 
         self._release_cuda_graphs()
+        self._log_debug_memory(
+            "switch_and_prepare_after_release",
+            old_dp_size=old_dp_size,
+            old_ep_size=old_ep_size,
+        )
         _replace_active_groups(**pop_standby_groups())
+        self._log_debug_memory(
+            "switch_and_prepare_after_activate_standby",
+            old_dp_size=old_dp_size,
+            old_ep_size=old_ep_size,
+        )
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -412,6 +586,13 @@ class ElasticEPScalingExecutor:
                     module.quant_method = module.quant_method.old_quant_method
                     module.runner = module._init_runner()
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
+        self._log_debug_memory(
+            "switch_and_prepare_after_prepare_comm_buffer",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+            old_ep_size=old_ep_size,
+            new_ep_size=new_ep_size,
+        )
         if (
             self.worker.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -438,6 +619,13 @@ class ElasticEPScalingExecutor:
         unlock_workspace()
         self.worker.compile_or_warm_up_model()
         lock_workspace()
+        self._log_debug_memory(
+            "switch_and_prepare_after_warmup",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+            old_ep_size=old_ep_size,
+            new_ep_size=new_ep_size,
+        )
 
         for bt, (saved_gpu, saved_cpu) in zip(
             multi_block_table.block_tables, saved_block_tables
@@ -452,6 +640,10 @@ class ElasticEPScalingExecutor:
     ) -> None:
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Starting expert resharding...")
+        self._log_debug_memory(
+            "reshuffle_before",
+            rank_mapping_provided=rank_mapping is not None,
+        )
 
         eplb_state = self.worker.model_runner.eplb_state
         assert eplb_state is not None
@@ -460,10 +652,18 @@ class ElasticEPScalingExecutor:
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
         is_async_enabled = eplb_state.is_async
         eplb_state.is_async = False
-        if rank_mapping is None:
-            eplb_state.rearrange()
-        else:
-            eplb_state.rearrange(rank_mapping=rank_mapping)
+        try:
+            if rank_mapping is None:
+                eplb_state.rearrange()
+            else:
+                eplb_state.rearrange(rank_mapping=rank_mapping)
+        except Exception:
+            self._log_debug_memory(
+                "reshuffle_exception",
+                rank_mapping_provided=rank_mapping is not None,
+                num_valid_physical_experts=eplb_state.num_valid_physical_experts,
+            )
+            raise
         # NOTE(yongji): check whether we need to synchronize here
         torch.accelerator.synchronize()
         # reset expert_rearrangement_step to ensure all ranks are synchronized
@@ -472,6 +672,11 @@ class ElasticEPScalingExecutor:
             eplb_model_state.physical_to_logical_map.shape[1]
         )
         eplb_state.is_async = is_async_enabled
+        self._log_debug_memory(
+            "reshuffle_after",
+            rank_mapping_provided=rank_mapping is not None,
+            num_valid_physical_experts=eplb_state.num_valid_physical_experts,
+        )
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Expert resharding completed")
 
@@ -496,6 +701,11 @@ class ElasticEPScalingExecutor:
         assert isinstance(dp_group, StatelessGroupCoordinator)
         new_dp_size = dp_group.world_size
         dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+        self._log_debug_memory(
+            "receive_weights_start",
+            new_dp_size=new_dp_size,
+            dp_rank=dp_rank,
+        )
 
         # Receive old_dp_size broadcasted during transfer_weights
         old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
@@ -526,6 +736,13 @@ class ElasticEPScalingExecutor:
             expert_weights=model.expert_weights,
         )
         torch.accelerator.synchronize()
+        self._log_debug_memory(
+            "receive_weights_done",
+            old_dp_size=old_dp_size,
+            new_dp_size=new_dp_size,
+            dp_rank=dp_rank,
+            sender_rank=sender_rank,
+        )
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
@@ -559,5 +776,7 @@ class ElasticEPScalingExecutor:
         )
 
     def prepare_new_worker(self) -> None:
+        self._log_debug_memory("prepare_new_worker_before_comm_buffer")
         with set_current_vllm_config(self.worker.vllm_config):
             prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+        self._log_debug_memory("prepare_new_worker_after_comm_buffer")
