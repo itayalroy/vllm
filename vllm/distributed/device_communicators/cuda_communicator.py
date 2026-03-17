@@ -346,10 +346,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
         if self.all2all_manager is not None:
+            if destroy_persistent_state:
+                logger.info(
+                    "Destroying all2all manager with persistent state: %s",
+                    self.all2all_manager.__class__.__name__,
+                )
             self.all2all_manager.destroy(
                 destroy_persistent_state=destroy_persistent_state
             )
             self.all2all_manager = None  # type: ignore[assignment]
+        elif destroy_persistent_state:
+            logger.warning(
+                "Persistent-state destroy requested but no all2all manager exists."
+            )
 
     def all_gatherv(
         self,

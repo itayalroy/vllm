@@ -540,10 +540,38 @@ class NixlEPAll2AllManager(All2AllManagerBase):
             if destroy_persistent_state:
                 NixlEPAll2AllManager._buffer = None
         if buffer_state is None:
+            if destroy_persistent_state:
+                logger.warning(
+                    "NIXL EP persistent destroy requested but no buffer exists."
+                )
             return
-        buffer, _ = buffer_state
+        buffer, current_ep_size = buffer_state
         if destroy_persistent_state:
-            buffer.destroy()
+            logger.info(
+                "Destroying NIXL EP persistent buffer "
+                "(rank=%d, world_size=%d, ep_size=%d)",
+                self.rank,
+                self.world_size,
+                current_ep_size,
+            )
+            try:
+                buffer.destroy()
+            except Exception:
+                logger.exception(
+                    "Failed to destroy NIXL EP persistent buffer "
+                    "(rank=%d, world_size=%d, ep_size=%d)",
+                    self.rank,
+                    self.world_size,
+                    current_ep_size,
+                )
+                raise
+            logger.info(
+                "Destroyed NIXL EP persistent buffer "
+                "(rank=%d, world_size=%d, ep_size=%d)",
+                self.rank,
+                self.world_size,
+                current_ep_size,
+            )
         else:
             buffer.set_tcp_store_group(None)
 
