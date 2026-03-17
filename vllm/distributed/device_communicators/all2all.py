@@ -15,6 +15,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_nvlink_two_sided,
 )
 from vllm.utils.import_utils import has_deep_ep, has_mori
+from vllm.utils.mem_utils import MemorySnapshot
 
 from .base_device_communicator import All2AllManagerBase, Cache
 
@@ -442,6 +443,35 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
 
+    def _log_persistent_destroy_snapshot(
+        self,
+        stage: str,
+        current_ep_size: int,
+    ) -> MemorySnapshot | None:
+        try:
+            snapshot = MemorySnapshot()
+        except Exception:
+            logger.exception(
+                "Failed to capture NIXL EP persistent destroy snapshot "
+                "(stage=%s, rank=%d, world_size=%d, ep_size=%d)",
+                stage,
+                self.rank,
+                self.world_size,
+                current_ep_size,
+            )
+            return None
+
+        logger.info(
+            "NIXL EP persistent destroy memory %s "
+            "(rank=%d, world_size=%d, ep_size=%d): %s",
+            stage,
+            self.rank,
+            self.world_size,
+            current_ep_size,
+            snapshot,
+        )
+        return snapshot
+
     def _init_buffer(
         self,
         max_num_tokens_per_dp_rank: int,
@@ -554,6 +584,9 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                 self.world_size,
                 current_ep_size,
             )
+            before_snapshot = self._log_persistent_destroy_snapshot(
+                "before", current_ep_size
+            )
             try:
                 buffer.destroy()
             except Exception:
@@ -565,6 +598,18 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                     current_ep_size,
                 )
                 raise
+            after_snapshot = self._log_persistent_destroy_snapshot(
+                "after", current_ep_size
+            )
+            if before_snapshot is not None and after_snapshot is not None:
+                logger.info(
+                    "NIXL EP persistent destroy memory delta "
+                    "(rank=%d, world_size=%d, ep_size=%d): %s",
+                    self.rank,
+                    self.world_size,
+                    current_ep_size,
+                    after_snapshot - before_snapshot,
+                )
             logger.info(
                 "Destroyed NIXL EP persistent buffer "
                 "(rank=%d, world_size=%d, ep_size=%d)",
