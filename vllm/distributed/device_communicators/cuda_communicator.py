@@ -336,7 +336,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         else:
             raise ValueError("No PyNCCL communicator found")
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
@@ -346,7 +346,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.fi_ar_comm.destroy()
             self.fi_ar_comm = None
         if self.all2all_manager is not None:
-            self.all2all_manager.destroy()
+            self.all2all_manager.destroy(
+                destroy_persistent_state=destroy_persistent_state
+            )
             self.all2all_manager = None  # type: ignore[assignment]
 
     def all_gatherv(

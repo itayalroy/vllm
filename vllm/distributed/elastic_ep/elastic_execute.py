@@ -438,7 +438,15 @@ class ElasticEPScalingExecutor:
         self._log_debug_memory("switch_and_remove_before_release")
         self._release_cuda_graphs()
         self._log_debug_memory("switch_and_remove_after_release")
-        _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        self._log_debug_memory("switch_and_remove_before_drop_groups")
+        _replace_active_groups(
+            world=None,
+            dp=None,
+            ep=None,
+            eplb=None,
+            node_count=None,
+            destroy_persistent_state=True,
+        )
         self._log_debug_memory("switch_and_remove_after_drop_groups")
 
     def switch_and_prepare(self) -> None:

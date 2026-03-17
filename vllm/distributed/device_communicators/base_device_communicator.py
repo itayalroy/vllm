@@ -109,7 +109,7 @@ class All2AllManagerBase:
     def combine(self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False):
         raise NotImplementedError
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         pass
 
 
@@ -307,7 +307,7 @@ class DeviceCommunicatorBase:
         torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
         return tensor
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         pass
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module) -> None:

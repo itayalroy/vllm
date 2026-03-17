@@ -1049,7 +1049,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         if hasattr(self, "device_group"):
             torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
@@ -1057,7 +1057,9 @@ class GroupCoordinator:
             torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.device_communicator is not None:
-            self.device_communicator.destroy()
+            self.device_communicator.destroy(
+                destroy_persistent_state=destroy_persistent_state
+            )
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1193,16 +1195,19 @@ def _replace_active_groups(
     ep: GroupCoordinator | None,
     eplb: GroupCoordinator | None,
     node_count: int | None,
+    destroy_persistent_state: bool = False,
 ) -> None:
     """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
 
     Destruction is collective — all ranks in the old groups must call this
-    function together.  Pass all-``None`` to tear down without replacement.
+    function together. Pass all-``None`` to tear down without replacement.
+    Set ``destroy_persistent_state`` when final cleanup must also release
+    backend state that outlives a manager instance.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
     for group in (_DP, _EP, _WORLD, _EPLB):
         if group is not None:
-            group.destroy()
+            group.destroy(destroy_persistent_state=destroy_persistent_state)
     _WORLD = world
     _DP = dp
     _EP = ep

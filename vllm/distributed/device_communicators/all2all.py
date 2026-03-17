@@ -142,7 +142,7 @@ class NaiveAll2AllManager(All2AllManagerBase):
         hidden_states = all_hidden_states[start:end, :]
         return hidden_states
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         pass
 
 
@@ -244,7 +244,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         pass
 
 
@@ -295,7 +295,7 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         with self.handle_cache._lock:
             for _, handle in self.handle_cache._cache.items():
                 handle.destroy()
@@ -462,6 +462,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         )
         buffer = Buffer(
             rank=self.rank,
+            explicitly_destroy=True,
             tcp_store_group=self.tcp_store_group.store,
         )
         buffer.update_memory_buffers(
@@ -530,12 +531,21 @@ class NixlEPAll2AllManager(All2AllManagerBase):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         # NOTE(yongji): NIXLEPAll2AllManager instance is recreated during
-        # scale-up/down, so we cannot destroy the persistent buffer here.
-        assert NixlEPAll2AllManager._buffer is not None
-        buffer = NixlEPAll2AllManager._buffer[0]
-        buffer.set_tcp_store_group(None)
+        # scale-up/down, so only removing ranks should destroy the persistent
+        # buffer.
+        with NixlEPAll2AllManager._lock:
+            buffer_state = NixlEPAll2AllManager._buffer
+            if destroy_persistent_state:
+                NixlEPAll2AllManager._buffer = None
+        if buffer_state is None:
+            return
+        buffer, _ = buffer_state
+        if destroy_persistent_state:
+            buffer.destroy()
+        else:
+            buffer.set_tcp_store_group(None)
 
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:

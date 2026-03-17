@@ -141,9 +141,11 @@ class StatelessGroupCoordinator(GroupCoordinator):
         )
         self.use_cpu_custom_send_recv = False
 
-    def destroy(self):
+    def destroy(self, *, destroy_persistent_state: bool = False):
         if self.device_communicator:
-            self.device_communicator.destroy()
+            self.device_communicator.destroy(
+                destroy_persistent_state=destroy_persistent_state
+            )
         if self.device_group:
             stateless_destroy_torch_distributed_process_group(self.device_group)
         if self.cpu_group:
