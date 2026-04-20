@@ -406,11 +406,16 @@ class ElasticEPScalingExecutor:
                 num_physical_experts=num_physical_experts,
                 num_local_physical_experts=num_local_experts,
             )
-            # Force re-creation of the modular kernel (and all2all manager)
-            # for the new EP size by resetting quant_method to base
+            # Force re-creation of the old modular kernel path and rebuild any
+            # deferred internal kernels for the new EP size.
             for module in moe_modules:
                 if hasattr(module.quant_method, "old_quant_method"):
                     module._replace_quant_method(module.quant_method.old_quant_method)
+                elif hasattr(
+                    module.quant_method,
+                    "reinitialize_moe_kernel_for_elastic_ep",
+                ):
+                    module.quant_method.reinitialize_moe_kernel_for_elastic_ep(module)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
         eplb_model_state.communicator = create_eplb_communicator(
@@ -566,5 +571,16 @@ class ElasticEPScalingExecutor:
         )
 
     def prepare_new_worker(self) -> None:
+        model = self.worker.model_runner.get_model()
+        for module in model.modules():
+            if (
+                module.__class__.__name__ == "FusedMoE"
+                or module.__class__.__name__ == "SharedFusedMoE"
+            ) and hasattr(
+                module.quant_method,
+                "reinitialize_moe_kernel_for_elastic_ep",
+            ):
+                module.quant_method.reinitialize_moe_kernel_for_elastic_ep(module)
+
         with set_current_vllm_config(self.worker.vllm_config):
-            prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+            prepare_communication_buffer_for_model(model)

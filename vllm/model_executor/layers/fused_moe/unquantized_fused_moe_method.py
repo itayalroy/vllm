@@ -147,7 +147,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         return weight
 
-    def _setup_kernel(
+    def _prepare_weights_for_kernel(
         self,
         layer: Module,
         w13: torch.Tensor,
@@ -163,7 +163,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         replace_parameter(layer, "w13_weight", w13)
         replace_parameter(layer, "w2_weight", w2)
 
-        # Setup moe kernel.
+    def _setup_kernel(self, layer: Module) -> None:
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
@@ -229,17 +229,37 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             w13.data = w13.transpose(-1, -2).contiguous()
             w2.data = w2.transpose(-1, -2).contiguous()
 
-            self._setup_kernel(
+            self._prepare_weights_for_kernel(
                 layer=layer,
                 w13=w13,
                 w2=w2,
             )
         else:
-            self._setup_kernel(
+            self._prepare_weights_for_kernel(
                 layer=layer,
                 w13=layer.w13_weight,
                 w2=layer.w2_weight,
             )
+
+        # TODO(elastic-ep): Replace this defer with EP communicator expansion
+        # once NIXL EP can grow via connect_ranks() without forcing CUDA graph
+        # recapture during elastic scale-up.
+        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            return
+
+        self._setup_kernel(layer)
+
+    def reinitialize_moe_kernel_for_elastic_ep(
+        self, layer: torch.nn.Module
+    ) -> None:
+        if self.unquantized_backend in [
+            UnquantizedMoeBackend.TPU,
+            UnquantizedMoeBackend.OOT,
+            UnquantizedMoeBackend.CPU,
+        ]:
+            return
+
+        self._setup_kernel(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
         if self.moe.has_bias:
