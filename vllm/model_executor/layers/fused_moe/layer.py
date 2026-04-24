@@ -613,13 +613,12 @@ class FusedMoE(PluggableLayer):
         self.quant_method = mk
         self.runner._replace_quant_method(mk)
 
-    # Note: maybe_init_modular_kernel should only be called by
-    # prepare_communication_buffer_for_model.
-    # This is called after all weight loading and post-processing, so it
-    # should be safe to swap out the quant_method.
+    # This should only be called after all weight loading and post-processing,
+    # so it is safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
         # NOTE(rob): WIP refactor. For quant methods that own the MK
-        # we create the MK during process_weights_after_loading.
+        # we create the MK during process_weights_after_loading. EEP
+        # reconfiguration stages/commits its prepare/finalize explicitly.
         if self.quant_method.supports_internal_mk or self.quant_method.is_monolithic:
             return None
 
@@ -643,6 +642,23 @@ class FusedMoE(PluggableLayer):
                     inplace=not self.moe_config.disable_inplace,
                 )
             )
+
+    def eep_stage_prepare_finalize(
+        self,
+        moe_config: FusedMoEConfig,
+    ) -> None:
+        if not self.quant_method.supports_internal_mk or hasattr(
+            self.quant_method, "old_quant_method"
+        ):
+            return
+        self.quant_method.eep_stage_prepare_finalize_for_layer(self, moe_config)
+
+    def eep_commit_prepare_finalize(self) -> None:
+        if not self.quant_method.supports_internal_mk or hasattr(
+            self.quant_method, "old_quant_method"
+        ):
+            return
+        self.quant_method.eep_commit_prepare_finalize_for_layer(self)
 
     @property
     def shared_experts(self) -> SharedExperts | None:
