@@ -7,6 +7,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import envs
+from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -137,6 +138,14 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def max_num_tokens_per_rank(self) -> int | None:
         return self.max_tokens_per_rank
+
+    def on_commit(self) -> None:
+        device_communicator = get_ep_group().device_communicator
+        assert device_communicator is not None
+        all2all_manager = device_communicator.all2all_manager
+        assert all2all_manager is not None
+        all2all_manager.activate_connected_ranks()  # type: ignore[attr-defined]
+        self.num_dispatchers_ = all2all_manager.world_size
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int64

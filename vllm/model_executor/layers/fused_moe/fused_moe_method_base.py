@@ -29,6 +29,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self.moe: FusedMoEConfig = moe
         self.moe_quant_config: FusedMoEQuantConfig | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
+        self._staged_prepare_finalize: mk.FusedMoEPrepareAndFinalize | None = None
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -100,13 +101,51 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalizeModular | None:
-        from .all2all_utils import maybe_make_prepare_finalize
-
-        pf = maybe_make_prepare_finalize(
-            self.moe, self.moe_quant_config, routing_tables
-        )
+        pf = self._make_prepare_finalize(routing_tables=routing_tables)
         assert pf is None or isinstance(pf, FusedMoEPrepareAndFinalizeModular)
         return pf
+
+    def _make_prepare_finalize(
+        self,
+        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEPrepareAndFinalize | None:
+        from .all2all_utils import maybe_make_prepare_finalize
+
+        return maybe_make_prepare_finalize(
+            moe_config or self.moe,
+            self.moe_quant_config,
+            routing_tables,
+            use_monolithic=self.is_monolithic,
+            eep_stage=eep_stage,
+        )
+
+    def eep_stage_prepare_finalize_for_layer(
+        self,
+        layer: torch.nn.Module,
+        moe: FusedMoEConfig,
+    ) -> None:
+        if self.moe_kernel is None:
+            return
+
+        prepare_finalize = self._make_prepare_finalize(
+            routing_tables=None,
+            moe_config=moe,
+            eep_stage=True,
+        )
+        if prepare_finalize is None:
+            return
+        self._staged_prepare_finalize = prepare_finalize
+
+    def eep_commit_prepare_finalize_for_layer(self, layer: torch.nn.Module) -> None:
+        if self.moe_kernel is None or self._staged_prepare_finalize is None:
+            return
+
+        staged_prepare_finalize = self._staged_prepare_finalize
+        self._staged_prepare_finalize = None
+        self.moe_kernel.commit_prepare_finalize(staged_prepare_finalize)
 
     def select_gemm_impl(
         self,
