@@ -613,10 +613,8 @@ class FusedMoE(PluggableLayer):
         self.quant_method = mk
         self.runner._replace_quant_method(mk)
 
-    # Note: maybe_init_modular_kernel should only be called by
-    # prepare_communication_buffer_for_model.
-    # This is called after all weight loading and post-processing, so it
-    # should be safe to swap out the quant_method.
+    # This should only be called after all weight loading and post-processing,
+    # so it is safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
@@ -643,6 +641,43 @@ class FusedMoE(PluggableLayer):
                     inplace=not self.moe_config.disable_inplace,
                 )
             )
+
+    def eep_stage_prepare_finalize(
+        self,
+        moe_config: FusedMoEConfig,
+    ) -> None:
+        if not self.quant_method.supports_internal_mk or hasattr(
+            self.quant_method, "old_quant_method"
+        ):
+            return
+        old_batched_format = (
+            self.moe_config.moe_parallel_config.use_batched_activation_format
+        )
+        new_batched_format = (
+            moe_config.moe_parallel_config.use_batched_activation_format
+        )
+        if old_batched_format != new_batched_format:
+            raise NotImplementedError(
+                "Elastic EP prepare/finalize-only reconfiguration does not "
+                "support changing MoE activation format. This requires staging "
+                "and committing the full modular kernel."
+            )
+        if not moe_config.moe_parallel_config.supports_eep_prepare_finalize_staging:
+            raise NotImplementedError(
+                "Elastic EP prepare/finalize staging is not supported for "
+                "all2all backend "
+                f"{moe_config.moe_parallel_config.all2all_backend!r}. The "
+                "backend must support staged communicator setup while the "
+                "active communicator continues serving."
+            )
+        self.quant_method.eep_stage_prepare_finalize_for_layer(moe_config)
+
+    def eep_commit_prepare_finalize(self) -> None:
+        if not self.quant_method.supports_internal_mk or hasattr(
+            self.quant_method, "old_quant_method"
+        ):
+            return
+        self.quant_method.eep_commit_prepare_finalize_for_layer()
 
     @property
     def shared_experts(self) -> SharedExperts | None:

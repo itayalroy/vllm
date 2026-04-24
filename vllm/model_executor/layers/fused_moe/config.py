@@ -1012,6 +1012,10 @@ class FusedMoEParallelConfig:
     def use_nixl_ep_kernels(self):
         return self.use_all2all_kernels and self.all2all_backend == "nixl_ep"
 
+    @property
+    def supports_eep_prepare_finalize_staging(self):
+        return self.use_ag_rs_all2all_kernels or self.use_nixl_ep_kernels
+
     @staticmethod
     def flatten_tp_across_dp_and_pcp(
         tp_size: int, dp_size: int, dp_rank: int, pcp_size: int, pcp_rank: int
