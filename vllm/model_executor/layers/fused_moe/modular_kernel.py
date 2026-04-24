@@ -246,6 +246,13 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return False
 
+    def on_commit(self) -> None:
+        """
+        Runs after this prepare/finalize has been committed to the active
+        MoE kernel.
+        """
+        return
+
 
 # TODO: pass FusedMoEParallelConfig in as ctor parameter?
 class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
@@ -1525,6 +1532,18 @@ class FusedMoEKernel:
             return self.impl.shared_experts is not None
         else:
             return False
+
+    @property
+    def owned_shared_experts(self) -> SharedExperts | None:
+        if isinstance(self.impl, FusedMoEKernelModularImpl):
+            return self.impl.shared_experts
+        return None
+
+    @property
+    def inplace(self) -> bool:
+        if isinstance(self.impl, FusedMoEKernelModularImpl):
+            return self.impl.inplace
+        return False
 
     @property
     def is_monolithic(self) -> bool:
