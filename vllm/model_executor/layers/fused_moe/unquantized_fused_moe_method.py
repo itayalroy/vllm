@@ -167,13 +167,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.moe_quant_config is not None
         assert self.experts_cls is not None
-        self.moe_kernel = make_unquantized_moe_kernel(
+        self.moe_kernel = self._make_moe_kernel(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: torch.nn.Module,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ):
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
+        return make_unquantized_moe_kernel(
             quant_config=self.moe_quant_config,
-            moe_config=self.moe,
+            moe_config=moe_config or self.moe,
             backend=self.unquantized_backend,
             experts_cls=self.experts_cls,
-            routing_tables=layer._maybe_init_expert_routing_tables(),
+            routing_tables=self._make_moe_kernel_routing_tables(layer, eep_stage),
             shared_experts=layer.shared_experts,
+            eep_stage=eep_stage,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

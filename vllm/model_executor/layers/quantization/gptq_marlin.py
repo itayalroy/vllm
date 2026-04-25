@@ -759,9 +759,19 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         """Build the FusedMoEKernel for this layer."""
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        self.moe_kernel = make_wna16_moe_kernel(
+        self.moe_kernel = self._make_moe_kernel(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: FusedMoE,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ):
+        assert self.moe_quant_config is not None
+        return make_wna16_moe_kernel(
             moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
+            moe_config=moe_config or self.moe,
             experts_cls=self.experts_cls,
             layer=layer,
             is_k_full=self.is_k_full,
@@ -769,8 +779,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             w2_g_idx=layer.w2_g_idx,
             w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
             w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
-            routing_tables=layer._maybe_init_expert_routing_tables(),
+            routing_tables=self._make_moe_kernel_routing_tables(layer, eep_stage),
             shared_experts=layer.shared_experts,
+            eep_stage=eep_stage,
         )
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:

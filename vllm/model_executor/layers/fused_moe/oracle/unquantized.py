@@ -341,6 +341,7 @@ def make_unquantized_moe_kernel(
     experts_cls: type[mk.FusedMoEExperts],
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     shared_experts: SharedExperts | None = None,
+    eep_stage: bool = False,
 ) -> mk.FusedMoEKernel:
     # Create Prepare/Finalize
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
@@ -350,6 +351,7 @@ def make_unquantized_moe_kernel(
         routing_tables=routing_tables,
         allow_new_interface=True,
         use_monolithic=is_monolithic,
+        eep_stage=eep_stage,
     )
     assert prepare_finalize is not None
 

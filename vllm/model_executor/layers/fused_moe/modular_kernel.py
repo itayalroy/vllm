@@ -1534,41 +1534,6 @@ class FusedMoEKernel:
     def fused_experts(self) -> FusedMoEExperts:
         return self.impl.fused_experts
 
-    def commit_prepare_finalize(
-        self, prepare_finalize: FusedMoEPrepareAndFinalize | None = None
-    ) -> None:
-        if prepare_finalize is not None:
-            if isinstance(self.impl, FusedMoEKernelModularImpl):
-                if not isinstance(prepare_finalize, FusedMoEPrepareAndFinalizeModular):
-                    raise ValueError(
-                        "Cannot install monolithic prepare/finalize into a modular "
-                        "FusedMoEKernel."
-                    )
-            elif not isinstance(prepare_finalize, FusedMoEPrepareAndFinalizeMonolithic):
-                raise ValueError(
-                    "Cannot install modular prepare/finalize into a monolithic "
-                    "FusedMoEKernel."
-                )
-            self.impl.prepare_finalize = prepare_finalize
-            self._post_init_setup()
-
-        self.prepare_finalize.on_commit()
-
-        if not isinstance(self.impl, FusedMoEKernelModularImpl):
-            return
-        if (
-            self.prepare_finalize.activation_format
-            != FusedMoEActivationFormat.BatchedExperts
-        ):
-            return
-
-        max_num_tokens = self.prepare_finalize.max_num_tokens_per_rank()
-        assert max_num_tokens is not None
-        self.impl.fused_experts.max_num_tokens = max_num_tokens
-        self.impl.fused_experts.num_dispatchers = (
-            self.prepare_finalize.num_dispatchers()
-        )
-
     def _post_init_setup(self):
         """
         Resolve any leftover setup dependencies between self.prepare_finalize

@@ -155,6 +155,7 @@ def make_wna16_moe_kernel(
     w2_g_idx_sort_indices: torch.Tensor | None,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     shared_experts: torch.nn.Module | None = None,
+    eep_stage: bool = False,
 ) -> mk.FusedMoEKernel:
     # Currently, we only support MarlinExperts and BatchedMarlinExperts
     assert experts_cls in (MarlinExperts, BatchedMarlinExperts)
@@ -168,6 +169,7 @@ def make_wna16_moe_kernel(
         quant_config=moe_quant_config,
         routing_tables=routing_tables,
         allow_new_interface=True,
+        eep_stage=eep_stage,
     )
     assert prepare_finalize is not None
     assert isinstance(prepare_finalize, mk.FusedMoEPrepareAndFinalizeModular)

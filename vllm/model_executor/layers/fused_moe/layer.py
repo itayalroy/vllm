@@ -618,7 +618,7 @@ class FusedMoE(PluggableLayer):
     def maybe_init_modular_kernel(self) -> None:
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading. EEP
-        # reconfiguration stages/commits its prepare/finalize explicitly.
+        # reconfiguration stages/commits its MoE kernel explicitly.
         if self.quant_method.supports_internal_mk or self.quant_method.is_monolithic:
             return None
 
@@ -643,7 +643,7 @@ class FusedMoE(PluggableLayer):
                 )
             )
 
-    def eep_stage_prepare_finalize(
+    def eep_stage_moe_kernel(
         self,
         moe_config: FusedMoEConfig,
     ) -> None:
@@ -651,14 +651,14 @@ class FusedMoE(PluggableLayer):
             self.quant_method, "old_quant_method"
         ):
             return
-        self.quant_method.eep_stage_prepare_finalize_for_layer(self, moe_config)
+        self.quant_method.eep_stage_moe_kernel_for_layer(self, moe_config)
 
-    def eep_commit_prepare_finalize(self) -> None:
+    def eep_commit_moe_kernel(self) -> None:
         if not self.quant_method.supports_internal_mk or hasattr(
             self.quant_method, "old_quant_method"
         ):
             return
-        self.quant_method.eep_commit_prepare_finalize_for_layer(self)
+        self.quant_method.eep_commit_moe_kernel_for_layer()
 
     @property
     def shared_experts(self) -> SharedExperts | None:

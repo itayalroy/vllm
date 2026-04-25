@@ -355,14 +355,24 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
 
         # Build kernel (modular or monolithic)
         if self.moe_quant_config is not None and self.experts_cls is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                mxfp4_backend=self.mxfp4_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._maybe_init_expert_routing_tables(),
-                shared_experts=layer.shared_experts,
-            )
+            self.moe_kernel = self._make_moe_kernel(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: FusedMoE,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEKernel:
+        assert self.experts_cls is not None
+        return self._make_moe_kernel_from_oracle(
+            layer,
+            moe_config,
+            make_mxfp4_moe_kernel,
+            eep_stage=eep_stage,
+            mxfp4_backend=self.mxfp4_backend,
+            experts_cls=self.experts_cls,
+        )
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight

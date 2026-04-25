@@ -133,14 +133,24 @@ class CompressedTensorsW8A8Mxfp8MoEMethod(CompressedTensorsMoEMethod):
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None:
             assert self.experts_cls is not None
-            self.moe_kernel = make_fp8_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                fp8_backend=self.fp8_backend,
-                experts_cls=self.experts_cls,
-                routing_tables=layer._maybe_init_expert_routing_tables(),
-                shared_experts=layer.shared_experts,
-            )
+            self.moe_kernel = self._make_moe_kernel(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: FusedMoE,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEKernel:
+        assert self.experts_cls is not None
+        return self._make_moe_kernel_from_oracle(
+            layer,
+            moe_config,
+            make_fp8_moe_kernel,
+            eep_stage=eep_stage,
+            fp8_backend=self.fp8_backend,
+            experts_cls=self.experts_cls,
+        )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module

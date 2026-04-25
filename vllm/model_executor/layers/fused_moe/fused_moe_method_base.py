@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
+from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -29,7 +31,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self.moe: FusedMoEConfig = moe
         self.moe_quant_config: FusedMoEQuantConfig | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
-        self._staged_prepare_finalize: mk.FusedMoEPrepareAndFinalize | None = None
+        self._staged_moe_kernel: mk.FusedMoEKernel | None = None
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -122,30 +124,67 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             eep_stage=eep_stage,
         )
 
-    def eep_stage_prepare_finalize_for_layer(
+    def _make_moe_kernel_from_oracle(
+        self,
+        layer: Any,
+        moe_config: FusedMoEConfig | None,
+        make_moe_kernel: Callable[..., mk.FusedMoEKernel],
+        *,
+        eep_stage: bool,
+        **kwargs: Any,
+    ) -> mk.FusedMoEKernel:
+        assert self.moe_quant_config is not None
+        return make_moe_kernel(
+            moe_quant_config=self.moe_quant_config,
+            moe_config=moe_config or self.moe,
+            routing_tables=self._make_moe_kernel_routing_tables(layer, eep_stage),
+            shared_experts=layer.shared_experts,
+            eep_stage=eep_stage,
+            **kwargs,
+        )
+
+    def _make_moe_kernel_routing_tables(
+        self,
+        layer: Any,
+        eep_stage: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if eep_stage:
+            return None
+        return layer._maybe_init_expert_routing_tables()
+
+    def _make_moe_kernel(
         self,
         layer: torch.nn.Module,
-        moe: FusedMoEConfig,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEKernel:
+        raise ValueError(
+            f"{self.__class__.__name__} uses the internal modular kernel path, "
+            "but does not support Elastic EP kernel staging."
+        )
+
+    def eep_stage_moe_kernel_for_layer(
+        self,
+        layer: torch.nn.Module,
+        moe_config: FusedMoEConfig,
     ) -> None:
         if self.moe_kernel is None:
             return
 
-        prepare_finalize = self._make_prepare_finalize(
-            routing_tables=None,
-            moe_config=moe,
+        self._staged_moe_kernel = self._make_moe_kernel(
+            layer,
+            moe_config,
             eep_stage=True,
         )
-        if prepare_finalize is None:
-            return
-        self._staged_prepare_finalize = prepare_finalize
 
-    def eep_commit_prepare_finalize_for_layer(self, layer: torch.nn.Module) -> None:
-        if self.moe_kernel is None or self._staged_prepare_finalize is None:
+    def eep_commit_moe_kernel_for_layer(self) -> None:
+        if self._staged_moe_kernel is None:
             return
 
-        staged_prepare_finalize = self._staged_prepare_finalize
-        self._staged_prepare_finalize = None
-        self.moe_kernel.commit_prepare_finalize(staged_prepare_finalize)
+        self.moe_kernel = self._staged_moe_kernel
+        self._staged_moe_kernel = None
+        self.moe_kernel.prepare_finalize.on_commit()
 
     def select_gemm_impl(
         self,

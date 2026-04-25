@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
 )
 from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEConfig,
     FusedMoEQuantConfig,
     mxfp4_moe_quant_config,
 )
@@ -188,14 +189,23 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
 
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         if self.moe_quant_config is not None:
-            self.moe_kernel = make_mxfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                experts_cls=self.experts_cls,
-                mxfp4_backend=self.mxfp4_backend,
-                shared_experts=layer.shared_experts,
-                routing_tables=layer._maybe_init_expert_routing_tables(),
-            )
+            self.moe_kernel = self._make_moe_kernel(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: FusedMoE,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEKernel:
+        return self._make_moe_kernel_from_oracle(
+            layer,
+            moe_config,
+            make_mxfp4_moe_kernel,
+            eep_stage=eep_stage,
+            experts_cls=self.experts_cls,
+            mxfp4_backend=self.mxfp4_backend,
+        )
 
     def apply(
         self,

@@ -195,7 +195,7 @@ class ElasticEPScalingExecutor:
         if new_dp_size > old_dp_size:
             self._set_eplb_suppressed(True)
         elif new_dp_size < old_dp_size:
-            self._stage_standby_prepare_finalize()
+            self._stage_standby_moe_kernel()
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -263,17 +263,22 @@ class ElasticEPScalingExecutor:
             device=self.worker.device,
         )
         # New workers enter load_model after receiving the expert mapping.
-        # Stage prepare/finalize before returning to the state machine so
-        # existing ranks can participate in collective EP comm creation.
-        self._stage_standby_prepare_finalize()
+        # Stage the internal MoE kernels before returning to the state machine
+        # so existing ranks can participate in collective EP comm creation.
+        self._stage_standby_moe_kernel()
 
-    def _stage_standby_prepare_finalize(self) -> None:
+    def _moe_modules(self):
+        return [
+            module
+            for module in self.worker.model_runner.get_model().modules()
+            if is_moe_layer(module)
+        ]
+
+    def _stage_standby_moe_kernel(self) -> None:
         standby_dp_group = get_standby_dp_group()
         standby_ep_group = get_standby_ep_group()
-        model = self.worker.model_runner.get_model()
-        moe_modules = [module for module in model.modules() if is_moe_layer(module)]
-        for module in moe_modules:
-            module.eep_stage_prepare_finalize(
+        for module in self._moe_modules():
+            module.eep_stage_moe_kernel(
                 self._make_eep_moe_config(
                     module,
                     standby_dp_group,
@@ -296,11 +301,9 @@ class ElasticEPScalingExecutor:
             moe_parallel_config=moe_parallel_config,
         )
 
-    def eep_commit_prepare_finalize(self) -> None:
-        model = self.worker.model_runner.get_model()
-        moe_modules = [module for module in model.modules() if is_moe_layer(module)]
-        for module in moe_modules:
-            module.eep_commit_prepare_finalize()
+    def eep_commit_moe_kernel(self) -> None:
+        for module in self._moe_modules():
+            module.eep_commit_moe_kernel()
 
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
@@ -356,11 +359,7 @@ class ElasticEPScalingExecutor:
         )
 
         # Reconfigure MoE modules with new EP size
-        moe_modules = [
-            module
-            for module in self.worker.model_runner.model.modules()
-            if is_moe_layer(module)
-        ]
+        moe_modules = self._moe_modules()
         num_local_experts = moe_modules[0].moe_config.num_local_experts
         assert all(
             module.moe_config.num_local_experts == num_local_experts
@@ -437,7 +436,7 @@ class ElasticEPScalingExecutor:
                 num_physical_experts=num_physical_experts,
                 num_local_physical_experts=num_local_experts,
             )
-            self.eep_commit_prepare_finalize()
+            self.eep_commit_moe_kernel()
             # Legacy modular methods still need to be recreated for the
             # new EP size by resetting quant_method to base.
             for module in moe_modules:

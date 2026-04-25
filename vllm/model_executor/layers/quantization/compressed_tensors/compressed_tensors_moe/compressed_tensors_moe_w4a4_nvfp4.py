@@ -231,14 +231,24 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # Setup modular kernel.
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
         assert self.experts_cls is not None
-        self.moe_kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-            shared_experts=layer.shared_experts,
-            routing_tables=layer._maybe_init_expert_routing_tables(),
-        )
+        self.moe_kernel = self._make_moe_kernel(layer)
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+    def _make_moe_kernel(
+        self,
+        layer: FusedMoE,
+        moe_config: FusedMoEConfig | None = None,
+        *,
+        eep_stage: bool = False,
+    ) -> mk.FusedMoEKernel:
+        assert self.experts_cls is not None
+        return self._make_moe_kernel_from_oracle(
+            layer,
+            moe_config,
+            make_nvfp4_moe_kernel,
+            eep_stage=eep_stage,
+            experts_cls=self.experts_cls,
+        )
 
     def maybe_make_prepare_finalize(
         self,
