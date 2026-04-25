@@ -55,10 +55,10 @@ def _get_ep_all2all_manager(eep_stage: bool = False) -> Any:
 
         ep_group = get_standby_ep_group()
         assert ep_group is not None
+        device_communicator = ep_group.device_communicator
     else:
-        ep_group = get_ep_group()
+        device_communicator = get_ep_group().device_communicator
 
-    device_communicator = ep_group.device_communicator
     assert device_communicator is not None
     all2all_manager = device_communicator.all2all_manager
     assert all2all_manager is not None
