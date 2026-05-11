@@ -642,42 +642,22 @@ class FusedMoE(PluggableLayer):
                 )
             )
 
-    def eep_stage_prepare_finalize(
+    def eep_make_staged_quant_method(
         self,
         moe_config: FusedMoEConfig,
-    ) -> None:
-        if not self.quant_method.supports_internal_mk or hasattr(
-            self.quant_method, "old_quant_method"
-        ):
-            return
+    ) -> FusedMoEMethodBase | None:
+        if not self.quant_method.supports_internal_mk:
+            return None
+        if getattr(self.quant_method, "wraps_legacy_quant_method", False):
+            return None
         old_batched_format = (
             self.moe_config.moe_parallel_config.use_batched_activation_format
         )
         new_batched_format = (
             moe_config.moe_parallel_config.use_batched_activation_format
         )
-        if old_batched_format != new_batched_format:
-            raise NotImplementedError(
-                "Elastic EP prepare/finalize-only reconfiguration does not "
-                "support changing MoE activation format. This requires staging "
-                "and committing the full modular kernel."
-            )
-        if not moe_config.moe_parallel_config.supports_eep_prepare_finalize_staging:
-            raise NotImplementedError(
-                "Elastic EP prepare/finalize staging is not supported for "
-                "all2all backend "
-                f"{moe_config.moe_parallel_config.all2all_backend!r}. The "
-                "backend must support staged communicator setup while the "
-                "active communicator continues serving."
-            )
-        self.quant_method.eep_stage_prepare_finalize_for_layer(moe_config)
-
-    def eep_commit_prepare_finalize(self) -> None:
-        if not self.quant_method.supports_internal_mk or hasattr(
-            self.quant_method, "old_quant_method"
-        ):
-            return
-        self.quant_method.eep_commit_prepare_finalize_for_layer()
+        assert old_batched_format == new_batched_format
+        return self.quant_method.eep_make_staged_quant_method(self, moe_config)
 
     @property
     def shared_experts(self) -> SharedExperts | None:

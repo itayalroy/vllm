@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from abc import abstractmethod
+from inspect import signature
 
 import torch
 
@@ -29,7 +30,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         self.moe: FusedMoEConfig = moe
         self.moe_quant_config: FusedMoEQuantConfig | None = None
         self.moe_kernel: mk.FusedMoEKernel | None = None
-        self._staged_prepare_finalize: mk.FusedMoEPrepareAndFinalize | None = None
 
     @property
     def supports_internal_mk(self) -> bool:
@@ -123,29 +123,89 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             eep_stage=eep_stage,
         )
 
-    def eep_stage_prepare_finalize_for_layer(
+    def _make_eep_reconstructed_experts(
         self,
+        old_experts: FusedMoEExpertsModular,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        moe_config: FusedMoEConfig,
+    ) -> FusedMoEExpertsModular:
+        experts_cls = old_experts.__class__
+        assert self.moe_quant_config is not None
+        experts_kwargs = {
+            "moe_config": moe_config,
+            "quant_config": self.moe_quant_config,
+        }
+        if (
+            prepare_finalize.activation_format
+            == mk.FusedMoEActivationFormat.BatchedExperts
+        ):
+            max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+            assert max_num_tokens is not None
+            experts_kwargs.update(
+                max_num_tokens=max_num_tokens,
+                num_dispatchers=prepare_finalize.num_dispatchers(),
+            )
+
+        # Expert kernels with extra init params need explicit EEP support.
+        generic_arg_names = set(signature(mk.FusedMoEExperts.__init__).parameters)
+        ctor_arg_names = set(signature(experts_cls.__init__).parameters)
+        unsupported_args = ctor_arg_names - generic_arg_names
+        missing_args = set(experts_kwargs) - ctor_arg_names
+        if unsupported_args or missing_args:
+            raise NotImplementedError(
+                f"{experts_cls.__name__} experts do not support Elastic EP."
+            )
+
+        return experts_cls(**experts_kwargs)
+
+    def eep_make_staged_quant_method(
+        self,
+        _layer: torch.nn.Module,
         moe: FusedMoEConfig,
-    ) -> None:
+    ) -> "FusedMoEMethodBase | None":
         if self.moe_kernel is None:
-            return
+            return None
+        if self.moe_kernel.is_monolithic:
+            raise NotImplementedError(
+                "Elastic EP full modular-kernel staging is not supported for "
+                "monolithic fused MoE kernels."
+            )
+        if self.moe_quant_config is None:
+            raise ValueError(
+                "Elastic EP full modular-kernel staging requires initialized "
+                "MoE quant config."
+            )
 
         prepare_finalize = self._make_prepare_finalize(
             routing_tables=None,
             moe_config=moe,
             eep_stage=True,
         )
-        if prepare_finalize is None:
-            return
-        self._staged_prepare_finalize = prepare_finalize
+        assert prepare_finalize is not None
+        assert isinstance(prepare_finalize, FusedMoEPrepareAndFinalizeModular)
 
-    def eep_commit_prepare_finalize_for_layer(self) -> None:
-        if self.moe_kernel is None or self._staged_prepare_finalize is None:
-            return
+        old_experts = self.moe_kernel.fused_experts
+        assert isinstance(old_experts, FusedMoEExpertsModular)
 
-        staged_prepare_finalize = self._staged_prepare_finalize
-        self.moe_kernel.commit_prepare_finalize(staged_prepare_finalize)
-        self._staged_prepare_finalize = None
+        experts = self._make_eep_reconstructed_experts(
+            old_experts,
+            prepare_finalize,
+            moe,
+        )
+
+        from .fused_moe_modular_method import FusedMoEModularMethod
+
+        base_quant_method = getattr(self, "old_quant_method", self)
+        return FusedMoEModularMethod(
+            base_quant_method,
+            mk.FusedMoEKernel(
+                prepare_finalize,
+                experts,
+                shared_experts=self.moe_kernel.owned_shared_experts,
+                inplace=self.moe_kernel.inplace,
+            ),
+            moe_config=moe,
+        )
 
     def select_gemm_impl(
         self,
