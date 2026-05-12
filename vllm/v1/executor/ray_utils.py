@@ -8,6 +8,7 @@ from concurrent.futures import Future
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
+import torch
 
 import vllm.platforms
 from vllm.config import ParallelConfig
@@ -63,6 +64,9 @@ try:
             # The flag indicates is set_device is called on
             # that thread.
             self.compiled_dag_cuda_device_set = False
+            # CUDA stream used by Ray Compiled DAG model execution. Runtime
+            # dummy batches should use the same stream to preserve ordering.
+            self.compiled_dag_cuda_stream: torch.cuda.Stream | None = None
 
         rpc_rank: int
 
@@ -88,6 +92,14 @@ try:
                 )
                 logger.exception(msg)
                 raise e
+
+        def execute_dummy_batch(self):
+            assert self.worker is not None
+            if self.compiled_dag_cuda_stream is not None:
+                current_platform.set_device(self.worker.device)
+                with torch.cuda.stream(self.compiled_dag_cuda_stream):
+                    return self.worker.execute_dummy_batch()
+            return self.worker.execute_dummy_batch()
 
         def get_node_ip(self) -> str:
             return get_ip()
@@ -131,6 +143,10 @@ try:
             # and it needs a special logic of self.setup_device_if_necessary()
             self.setup_device_if_necessary()
             assert self.worker is not None, "Worker is not initialized"
+            if current_platform.is_cuda_alike():
+                self.compiled_dag_cuda_stream = torch.cuda.current_stream(
+                    self.worker.device
+                )
             if len(execute_model_input) == 3:
                 scheduler_output, grammar_output, intermediate_tensors = (
                     execute_model_input
