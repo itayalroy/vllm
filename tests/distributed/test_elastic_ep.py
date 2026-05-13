@@ -59,8 +59,9 @@ def _run_gsm8k_eval(server: RemoteOpenAIServer, stage: str) -> float:
     return accuracy
 
 
+@pytest.mark.parametrize("all2all_backend", ["allgather_reducescatter", "nixl_ep"])
 @multi_gpu_test(num_gpus=4)
-def test_elastic_ep_scaling():
+def test_elastic_ep_scaling(all2all_backend: str):
     vllm_serve_args = [
         "--trust-remote-code",
         "--tensor-parallel-size",
@@ -73,7 +74,7 @@ def test_elastic_ep_scaling():
         str(MAX_NUM_SEQS),
         "--enable-expert-parallel",
         "--all2all-backend",
-        "allgather_reducescatter",
+        all2all_backend,
         "--enable-elastic-ep",
         "--enable-eplb",
         "--eplb-config.num_redundant_experts",
@@ -93,11 +94,15 @@ def test_elastic_ep_scaling():
     with RemoteOpenAIServer(
         MODEL_NAME, vllm_serve_args, env_dict={}, max_wait_seconds=1200
     ) as server:
-        initial_accuracy = _run_gsm8k_eval(server, "Initial (2 GPUs)")
+        initial_accuracy = _run_gsm8k_eval(
+            server, f"Initial (2 GPUs, {all2all_backend})"
+        )
 
         assert _send_scale_command(server, 4)
         time.sleep(10)
-        scale_up_accuracy = _run_gsm8k_eval(server, "After scale up (4 GPUs)")
+        scale_up_accuracy = _run_gsm8k_eval(
+            server, f"After scale up (4 GPUs, {all2all_backend})"
+        )
 
         assert scale_up_accuracy >= initial_accuracy - ACCURACY_TOL, (
             f"Scale up accuracy {scale_up_accuracy:.3f} dropped more than "
@@ -106,7 +111,9 @@ def test_elastic_ep_scaling():
 
         assert _send_scale_command(server, 2)
         time.sleep(5)
-        scale_down_accuracy = _run_gsm8k_eval(server, "After scale down (2 GPUs)")
+        scale_down_accuracy = _run_gsm8k_eval(
+            server, f"After scale down (2 GPUs, {all2all_backend})"
+        )
 
         assert scale_down_accuracy >= initial_accuracy - ACCURACY_TOL, (
             f"Scale down accuracy {scale_down_accuracy:.3f} dropped more than "
@@ -114,6 +121,7 @@ def test_elastic_ep_scaling():
         )
 
         print("\nAccuracy Summary:")
+        print(f"  Backend:    {all2all_backend}")
         print(f"  Initial:    {initial_accuracy:.3f}")
         print(
             f"  Scale up:   {scale_up_accuracy:.3f} "
