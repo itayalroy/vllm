@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import signal
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -346,6 +348,30 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         super().__init__(cpu_group, tcp_store_group)
 
         self.max_num_ep_ranks = envs.VLLM_NIXL_EP_MAX_NUM_RANKS
+        self._write_debug_rank_pid()
+
+    def _write_debug_rank_pid(self) -> None:
+        pid_dir = envs.VLLM_NIXL_EP_DEBUG_RANK_PID_DIR
+        if not pid_dir:
+            return
+
+        path = os.path.join(pid_dir, f"rank_{self.rank}.pid")
+        tmp_path = f"{path}.tmp.{os.getpid()}"
+        try:
+            os.makedirs(pid_dir, exist_ok=True)
+            with open(tmp_path, "w") as f:
+                f.write(str(os.getpid()))
+            os.replace(tmp_path, path)
+            logger.info(
+                "NIXL_EP_RANK_PID ep_rank=%d pid=%d path=%s",
+                self.rank,
+                os.getpid(),
+                path,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to write NIXL EP rank PID to %s", path, exc_info=True
+            )
 
     def _init_buffer(
         self,
@@ -365,10 +391,23 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         assert NixlEPAll2AllManager._buffer is None, (
             "NIXL EP buffer already initialized"
         )
-        buffer = Buffer(
-            rank=self.rank,
-            tcp_store_group=self.tcp_store_group.store,
-        )
+        try:
+            buffer = Buffer(
+                rank=self.rank,
+                tcp_store_group=self.tcp_store_group.store,
+                timeout_ms=envs.VLLM_NIXL_EP_TIMEOUT_MS,
+            )
+        except TypeError as exc:
+            if "timeout_ms" not in str(exc):
+                raise
+            logger.warning(
+                "Installed nixl_ep.Buffer does not accept timeout_ms; using "
+                "the NIXL default timeout"
+            )
+            buffer = Buffer(
+                rank=self.rank,
+                tcp_store_group=self.tcp_store_group.store,
+            )
         buffer.update_memory_buffers(
             num_ranks=self.max_num_ep_ranks,
             num_experts_per_rank=num_experts_per_rank,
@@ -498,9 +537,70 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         buffer = NixlEPAll2AllManager._buffer.buffer
         buffer.set_tcp_store_group(None)
 
+    def query_rank_mask(self) -> list[int]:
+        assert NixlEPAll2AllManager._buffer is not None
+        state = NixlEPAll2AllManager._buffer
+        mask = torch.empty(
+            (self.max_num_ep_ranks,),
+            dtype=torch.int32,
+            device=torch.device("cuda"),
+        )
+        state.buffer.query_mask_buffer(mask)
+        torch.accelerator.synchronize()
+        return mask[: self.world_size].cpu().tolist()
+
+    def log_rank_mask(self, reason: str) -> None:
+        logger.info(
+            "NIXL_EP_MASK reason=%s ep_rank=%d pid=%d mask=%s",
+            reason,
+            self.rank,
+            os.getpid(),
+            self.query_rank_mask(),
+        )
+
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
         return 0
+
+
+def maybe_log_nixl_ep_mask_after_forward() -> None:
+    if not envs.VLLM_NIXL_EP_LOG_MASK_AFTER_FORWARD:
+        return
+
+    try:
+        device_communicator = get_ep_group().device_communicator
+        if device_communicator is None:
+            return
+        manager = device_communicator.all2all_manager
+        if isinstance(manager, NixlEPAll2AllManager):
+            manager.log_rank_mask("after_forward")
+    except Exception:
+        logger.warning("Failed to query NIXL EP mask after forward", exc_info=True)
+
+
+def maybe_fault_inject_nixl_ep_after_dp_coordination() -> None:
+    trigger_path = envs.VLLM_NIXL_EP_FAULT_INJECTION_TRIGGER_PATH
+    if not trigger_path or not os.path.exists(trigger_path):
+        return
+
+    target_rank = envs.VLLM_NIXL_EP_FAULT_INJECTION_RANK
+    ep_rank = get_ep_group().rank_in_group
+    if target_rank < 0 or ep_rank != target_rank:
+        return
+
+    sigkill = getattr(signal, "SIGKILL", None)
+    if sigkill is None:
+        logger.warning("NIXL EP fault injection requested but SIGKILL is absent")
+        return
+
+    logger.warning(
+        "NIXL_EP_FAULT_INJECTION phase=after_dp_coordination "
+        "ep_rank=%d pid=%d trigger=%s signal=SIGKILL",
+        ep_rank,
+        os.getpid(),
+        trigger_path,
+    )
+    os.kill(os.getpid(), sigkill)
 
 
 class FlashInferNVLinkTwoSidedManager(All2AllManagerBase):

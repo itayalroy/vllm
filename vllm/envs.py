@@ -275,6 +275,12 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
+    VLLM_NIXL_EP_TIMEOUT_MS: int = 30000
+    VLLM_NIXL_EP_LOG_MASK_AFTER_FORWARD: bool = False
+    VLLM_NIXL_EP_DEBUG_RANK_PID_DIR: str = ""
+    VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS: int = 0
+    VLLM_NIXL_EP_FAULT_INJECTION_RANK: int = -1
+    VLLM_NIXL_EP_FAULT_INJECTION_TRIGGER_PATH: str = ""
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -1952,6 +1958,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
+    "VLLM_NIXL_EP_TIMEOUT_MS": lambda: int(
+        os.getenv("VLLM_NIXL_EP_TIMEOUT_MS", "30000")
+    ),
+    "VLLM_NIXL_EP_LOG_MASK_AFTER_FORWARD": lambda: bool(
+        int(os.getenv("VLLM_NIXL_EP_LOG_MASK_AFTER_FORWARD", "0"))
+    ),
+    "VLLM_NIXL_EP_DEBUG_RANK_PID_DIR": lambda: os.getenv(
+        "VLLM_NIXL_EP_DEBUG_RANK_PID_DIR", ""
+    ),
+    "VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS": lambda: int(
+        os.getenv("VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS", "0")
+    ),
+    "VLLM_NIXL_EP_FAULT_INJECTION_RANK": lambda: int(
+        os.getenv("VLLM_NIXL_EP_FAULT_INJECTION_RANK", "-1")
+    ),
+    "VLLM_NIXL_EP_FAULT_INJECTION_TRIGGER_PATH": lambda: os.getenv(
+        "VLLM_NIXL_EP_FAULT_INJECTION_TRIGGER_PATH", ""
+    ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
@@ -2070,6 +2094,12 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",
+        "VLLM_NIXL_EP_TIMEOUT_MS",
+        "VLLM_NIXL_EP_LOG_MASK_AFTER_FORWARD",
+        "VLLM_NIXL_EP_DEBUG_RANK_PID_DIR",
+        "VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS",
+        "VLLM_NIXL_EP_FAULT_INJECTION_RANK",
+        "VLLM_NIXL_EP_FAULT_INJECTION_TRIGGER_PATH",
         "VLLM_RANDOMIZE_DP_DUMMY_INPUTS",
         "VLLM_CI_USE_S3",
         "VLLM_MODEL_REDIRECT_PATH",

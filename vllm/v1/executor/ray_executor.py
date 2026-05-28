@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -464,7 +465,11 @@ class RayDistributedExecutor(Executor):
             # Get output only from a single worker (output_rank)
             # When PP is not used, we block here until the result is available.
             if not non_block:
-                output = refs[0].get()
+                try:
+                    output = refs[0].get()
+                except ray.exceptions.ActorDiedError:
+                    self._delay_on_actor_died_for_nixl_ep_debug()
+                    raise
                 detach_zero_copy_from_model_runner_output(output)
                 return output
 
@@ -476,13 +481,29 @@ class RayDistributedExecutor(Executor):
         assert self.kv_output_aggregator is not None
         if not non_block:
             # Block and get results from all workers
-            outputs = ray.get(refs)
+            try:
+                outputs = ray.get(refs)
+            except ray.exceptions.ActorDiedError:
+                self._delay_on_actor_died_for_nixl_ep_debug()
+                raise
             for output in outputs:
                 detach_zero_copy_from_model_runner_output(output)
             return self.kv_output_aggregator.aggregate(outputs)
 
         # Return a future that will aggregate outputs from all workers
         return FutureWrapper(refs, self.kv_output_aggregator)
+
+    def _delay_on_actor_died_for_nixl_ep_debug(self) -> None:
+        delay_s = envs.VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS
+        if delay_s <= 0:
+            return
+        logger.warning(
+            "Ray actor died during NIXL EP debug run; delaying executor "
+            "teardown for %d seconds so surviving workers can finish timeout "
+            "handling and mask logging.",
+            delay_s,
+        )
+        time.sleep(delay_s)
 
     def collective_rpc(  # type: ignore[override]
         self,

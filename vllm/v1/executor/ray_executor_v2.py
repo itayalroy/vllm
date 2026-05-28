@@ -3,6 +3,7 @@
 import copy
 import os
 import threading
+import time
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -465,6 +466,15 @@ class RayExecutorV2(MultiprocExecutor):
                     "RayWorkerProc rank=%s died unexpectedly, shutting down executor.",
                     dead_ranks,
                 )
+                delay_s = envs.VLLM_NIXL_EP_DELAY_ON_ACTOR_DIED_SECONDS
+                if delay_s > 0:
+                    logger.warning(
+                        "Ray worker died during NIXL EP debug run; delaying "
+                        "executor shutdown for %d seconds so surviving workers "
+                        "can finish timeout handling and mask logging.",
+                        delay_s,
+                    )
+                    time.sleep(delay_s)
                 executor.shutdown()
                 if executor.failure_callback is not None:
                     callback = executor.failure_callback
