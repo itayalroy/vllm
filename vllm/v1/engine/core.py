@@ -1952,42 +1952,18 @@ class DPEngineCoreProc(EngineCoreProc):
             json.dumps({"mask": mask, "ts": ts, "wave": wave}).encode(),
         )
 
-    def _wait_for_peer_masks(self, expected_peers: list[int], wave: int) -> None:
-        """Block up to 3s for every expected peer to publish wave-`wave`.
-
-        Logs a warning on timeout. The MISSING-key path in the caller does
-        the actual bookkeeping; this exists so the timeout is visible in
-        the log instead of silently swallowed.
-        """
-        from datetime import timedelta
-
-        from torch.distributed import DistStoreError
-
-        peer_keys = [self._mask_store_key(r, wave) for r in expected_peers]
-        if not peer_keys:
-            return
-        try:
-            self.dp_store.wait(peer_keys, timedelta(seconds=3))
-        except DistStoreError as e:
-            logger.warning(
-                "NIXL EP REPRO: dp_store.wait timed out on dp_rank=%d wave=%d: %s",
-                self.dp_rank,
-                wave,
-                e,
-            )
-
     def _collect_peer_payloads(
         self,
         expected_peers: list[int],
         wave: int,
         my_mask: list[int],
         my_ts: float,
+        stale_after_secs: float,
     ) -> tuple[dict[int, dict[str, Any] | str], set[int]]:
         """Read each peer's wave-`wave` payload from the dp_store.
 
         Returns (peer_payloads, missing). A peer is "missing" if its key
-        isn't there yet (peer hasn't reached this wave) or the payload
-        failed to parse.
+        isn't there yet, the payload is stale, or the payload failed to parse.
         """
         import json
 
@@ -2002,7 +1978,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 missing.add(r)
                 continue
             try:
-                payloads[r] = json.loads(self.dp_store.get(key).decode())
+                payload = json.loads(self.dp_store.get(key).decode())
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 logger.warning(
                     "NIXL EP REPRO: failed to decode wave-%d payload for dp%d: %s",
@@ -2012,6 +1988,24 @@ class DPEngineCoreProc(EngineCoreProc):
                 )
                 payloads[r] = "PARSE_ERROR"
                 missing.add(r)
+                continue
+
+            if not isinstance(payload, dict) or "mask" not in payload:
+                payloads[r] = "INVALID_PAYLOAD"
+                missing.add(r)
+                continue
+
+            try:
+                age = my_ts - float(payload["ts"])
+            except (KeyError, TypeError, ValueError):
+                payloads[r] = "INVALID_PAYLOAD"
+                missing.add(r)
+                continue
+
+            if abs(age) > stale_after_secs:
+                payload["stale"] = True
+                missing.add(r)
+            payloads[r] = payload
         return payloads, missing
 
     @staticmethod
@@ -2023,9 +2017,11 @@ class DPEngineCoreProc(EngineCoreProc):
             p = payloads[r]
             if isinstance(p, dict):
                 age = my_ts - float(p["ts"])
+                freshness = " STALE" if p.get("stale") else ""
                 lines.append(
                     f"    dp{r}: mask={p['mask']} "
-                    f"ts={p['ts']:.6f} (age={age:+.3f}s) wave={p.get('wave')}"
+                    f"ts={p['ts']:.6f} (age={age:+.3f}s) "
+                    f"wave={p.get('wave')}{freshness}"
                 )
             else:
                 lines.append(f"    dp{r}: {p}")
@@ -2072,22 +2068,33 @@ class DPEngineCoreProc(EngineCoreProc):
         ]
 
         self._publish_my_mask(my_mask, my_ts, my_wave)
-        self._wait_for_peer_masks(expected_peers, my_wave)
-        payloads, missing = self._collect_peer_payloads(
-            expected_peers, my_wave, my_mask, my_ts
-        )
+        stale_after_secs = 5.0
+        deadline = time.monotonic() + 3.0
+        while True:
+            payloads, missing = self._collect_peer_payloads(
+                expected_peers,
+                my_wave,
+                my_mask,
+                my_ts,
+                stale_after_secs,
+            )
+            if not missing or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
 
         per_rank_block = self._format_per_rank_payloads(payloads, my_ts)
 
         if missing:
             logger.warning(
                 "NIXL EP REPRO: skipping wave-%d check on dp_rank=%d -- "
-                "ranks %s have no wave-%d mask yet. Will retry.\n"
+                "ranks %s have no fresh wave-%d mask within 3.0s "
+                "(stale_after=%.1fs). Will retry.\n"
                 "  Partial state:\n%s",
                 my_wave,
                 self.dp_rank,
                 sorted(missing),
                 my_wave,
+                stale_after_secs,
                 per_rank_block,
             )
             return
