@@ -449,12 +449,13 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         width = getattr(buffer, "group_size", 0)
         if not isinstance(width, int) or width <= 0:
             return None
+        device = torch.device("cuda", torch.cuda.current_device())
         buf = NixlEPAll2AllManager._mask_read_buf
-        if buf is None or buf.numel() != width:
-            buf = torch.zeros(width, dtype=torch.int32, device="cpu")
+        if buf is None or buf.numel() != width or buf.device != device:
+            buf = torch.empty(width, dtype=torch.int32, device=device)
             NixlEPAll2AllManager._mask_read_buf = buf
         buffer.query_mask_buffer(buf)
-        return buf.clone()
+        return buf.cpu()
 
     # NIXL EP uses RDMA so no SMs are used for communication
     def max_sms_used(self) -> int | None:
