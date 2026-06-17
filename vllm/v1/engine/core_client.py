@@ -1236,6 +1236,7 @@ class DPAsyncMPClient(AsyncMPClient):
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
         self.prepared_elastic_scale_up: PreparedElasticScaleUp | None = None
+        self.eep_control_lock = asyncio.Lock()
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
@@ -1553,6 +1554,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Scale elastic EP data parallel size"""
+        if self.eep_control_lock.locked():
+            raise RuntimeError("Another Elastic EP control operation is in progress")
+        async with self.eep_control_lock:
+            await self._scale_elastic_ep(new_data_parallel_size)
+
+    async def _scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         cur_data_parallel_size = len(self.core_engines)
 
         assert new_data_parallel_size != cur_data_parallel_size, (
@@ -1585,18 +1592,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
     async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Prepare elastic EP scale-up without routing requests to new engines."""
-        cur_data_parallel_size = len(self.core_engines)
-        if self.prepared_elastic_scale_up is not None:
-            raise RuntimeError("An Elastic EP scale-up is already prepared")
-        if new_data_parallel_size <= cur_data_parallel_size:
-            raise ValueError("Elastic EP prepare only supports scale up")
+        if self.eep_control_lock.locked():
+            raise RuntimeError("Another Elastic EP control operation is in progress")
+        async with self.eep_control_lock:
+            cur_data_parallel_size = len(self.core_engines)
+            if self.prepared_elastic_scale_up is not None:
+                raise RuntimeError("An Elastic EP scale-up is already prepared")
+            if new_data_parallel_size <= cur_data_parallel_size:
+                raise ValueError("Elastic EP prepare only supports scale up")
 
-        assert self.vllm_config.parallel_config.data_parallel_backend == "ray", (
-            "Only ray DP backend supports scaling elastic EP"
-        )
-        await self._scale_up_elastic_ep(
-            cur_data_parallel_size, new_data_parallel_size, prepare_only=True
-        )
+            assert self.vllm_config.parallel_config.data_parallel_backend == "ray", (
+                "Only ray DP backend supports scaling elastic EP"
+            )
+            await self._scale_up_elastic_ep(
+                cur_data_parallel_size, new_data_parallel_size, prepare_only=True
+            )
 
     async def _eep_wait_for_setup_switch_complete(self) -> None:
         """Wait for core engines to switch to the new setup."""
@@ -1695,22 +1705,33 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if prepare_only:
             scale_up_vllm_config = copy.deepcopy(self.vllm_config)
         scale_up_vllm_config.parallel_config.eplb_config.num_redundant_experts = 0
-        start_new_worker_future = asyncio.to_thread(
-            self.resources.engine_manager.scale_up_elastic_ep,
-            scale_up_vllm_config,
-            new_data_parallel_size,
-            update_current_config=not prepare_only,
-            wait_for_init=not prepare_only,
+        start_new_worker_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.resources.engine_manager.scale_up_elastic_ep,
+                scale_up_vllm_config,
+                new_data_parallel_size,
+                update_current_config=not prepare_only,
+                wait_for_init=not prepare_only,
+            )
         )
 
         # Phase 3: Wait for new engines to be created
         # and reconfig messages to be received
         try:
-            await asyncio.gather(start_new_worker_future, *reconfig_futures)
+            await asyncio.gather(start_new_worker_task, *reconfig_futures)
         except Exception:
+            if not start_new_worker_task.done():
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await start_new_worker_task
             if wait_task is not None:
                 wait_task.cancel()
             self.utility_results.pop(EEP_NOTIFICATION_CALL_ID, None)
+            self.eep_scaling_cache = None
+            if prepare_only:
+                self.prepared_elastic_scale_up = None
+                self.resources.engine_manager.rollback_scale_up_elastic_ep(
+                    cur_data_parallel_size
+                )
             raise
         logger.info("[Elastic EP] Successfully started new engines")
 
