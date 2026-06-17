@@ -6,6 +6,7 @@ import threading
 import traceback
 import weakref
 from collections.abc import Iterable, Sequence
+from concurrent.futures import Future
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -148,10 +149,9 @@ class ElasticEPScalingExecutor:
         self.reconfig_request = None
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
         self._async_lock = threading.Lock()
-        self._async_task_id: str | None = None
+        self._async_method: str | None = None
         self._async_thread: threading.Thread | None = None
-        self._async_done = False
-        self._async_error: BaseException | None = None
+        self._async_future: Future[None] | None = None
         self._async_traceback: str | None = None
 
     @property
@@ -167,66 +167,73 @@ class ElasticEPScalingExecutor:
             raise ValueError(f"Unknown execute method: {execute_method}")
         return method(*args, **kwargs)
 
-    def start_async(self, task_id: str, execute_method: str, *args, **kwargs) -> None:
+    def start_async(self, execute_method: str, *args, **kwargs) -> None:
         with self._async_lock:
-            if self._async_task_id is not None:
-                if self._async_task_id == task_id:
+            if self._async_method is not None:
+                if self._async_method == execute_method:
                     return
                 raise RuntimeError(
-                    f"Elastic EP async task is already active: {self._async_task_id}"
+                    f"Elastic EP async method is already active: {self._async_method}"
                 )
 
-            self._async_task_id = task_id
-            self._async_done = False
-            self._async_error = None
+            future: Future[None] = Future()
+            self._async_method = execute_method
+            self._async_future = future
             self._async_traceback = None
             self._async_thread = threading.Thread(
                 target=self._run_async,
-                args=(task_id, execute_method, args, kwargs),
+                args=(execute_method, future, args, kwargs),
                 daemon=True,
                 name=f"ElasticEPAsync-{execute_method}",
             )
             self._async_thread.start()
 
-    def poll_async(self, task_id: str) -> bool:
+    def poll_async(self, execute_method: str) -> bool:
         with self._async_lock:
-            if self._async_task_id != task_id:
+            if self._async_method != execute_method:
                 raise RuntimeError(
-                    "Elastic EP async task mismatch: "
-                    f"expected {self._async_task_id}, got {task_id}"
+                    "Elastic EP async method mismatch: "
+                    f"expected {self._async_method}, got {execute_method}"
                 )
-            done = self._async_done
-            error = self._async_error
+            future = self._async_future
             error_traceback = self._async_traceback
 
-        if error is not None:
+        assert future is not None
+        if not future.done():
+            return False
+        try:
+            future.result()
+        except BaseException as e:
             raise RuntimeError(
-                f"Elastic EP async task {task_id} failed:\n{error_traceback}"
-            ) from error
-        return done
+                f"Elastic EP async method {execute_method} failed:\n{error_traceback}"
+            ) from e
+        return True
 
-    def clear_async(self, task_id: str) -> None:
+    def clear_async(self, execute_method: str) -> None:
         with self._async_lock:
-            if self._async_task_id != task_id:
+            if self._async_method != execute_method:
                 raise RuntimeError(
-                    "Elastic EP async task mismatch: "
-                    f"expected {self._async_task_id}, got {task_id}"
+                    "Elastic EP async method mismatch: "
+                    f"expected {self._async_method}, got {execute_method}"
                 )
-            if not self._async_done:
-                raise RuntimeError(f"Elastic EP async task {task_id} is not done")
+            future = self._async_future
+            assert future is not None
+            if not future.done():
+                raise RuntimeError(
+                    f"Elastic EP async method {execute_method} is not done"
+                )
             thread = self._async_thread
-            self._async_task_id = None
+            self._async_method = None
             self._async_thread = None
-            self._async_done = False
-            self._async_error = None
+            self._async_future = None
             self._async_traceback = None
         if thread is not None:
             thread.join(timeout=0)
 
     def _run_async(
         self,
-        task_id: str,
         execute_method: str,
+        future: Future[None],
         args: tuple,
         kwargs: dict,
     ) -> None:
@@ -239,17 +246,16 @@ class ElasticEPScalingExecutor:
             with set_current_vllm_config(self.worker.vllm_config):
                 self.execute(execute_method, *args, **kwargs)
         except BaseException as e:
-            logger.exception("[Elastic EP] Async worker task %s failed", task_id)
+            logger.exception(
+                "[Elastic EP] Async worker method %s failed", execute_method
+            )
             with self._async_lock:
-                if self._async_task_id == task_id:
-                    self._async_error = e
+                if self._async_method == execute_method:
                     self._async_traceback = traceback.format_exc()
-                    self._async_done = True
+            future.set_exception(e)
             return
 
-        with self._async_lock:
-            if self._async_task_id == task_id:
-                self._async_done = True
+        future.set_result(None)
 
     def _set_eplb_suppressed(self, suppressed: bool) -> None:
         self.worker.model_runner.eep_eplb_suppressed = suppressed

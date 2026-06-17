@@ -104,7 +104,7 @@ class ElasticEPScalingState:
         self.scale_type = scale_type
         self.reconfig_request = reconfig_request
         self.prepare_mode = prepare_mode
-        self._prepare_async_task_id: str | None = None
+        self._prepare_async_method: str | None = None
         self._prepare_async_last_poll = 0.0
 
         self.state: EngineState
@@ -142,37 +142,27 @@ class ElasticEPScalingState:
         with lock:
             return self.model_executor.collective_rpc(*args, **kwargs)
 
-    def _prepare_async_task_key(self, execute_method: str) -> str:
-        assert self.reconfig_request is not None
-        return (
-            f"elastic_ep_prepare_{execute_method}_"
-            f"{self.reconfig_request.coord_store_port}"
-        )
-
     def _is_prepare_async_active(self, execute_method: str) -> bool:
-        return self._prepare_async_task_id == self._prepare_async_task_key(
-            execute_method
-        )
+        return self._prepare_async_method == execute_method
 
     def _elastic_ep_execute(self, execute_method: str, *args) -> bool:
         if not self.prepare_mode:
             self._collective_rpc("elastic_ep_execute", args=(execute_method, *args))
             return True
 
-        task_id = self._prepare_async_task_key(execute_method)
-        if self._prepare_async_task_id is None:
+        if self._prepare_async_method is None:
             self._collective_rpc(
                 "elastic_ep_execute",
-                args=("start_async", task_id, execute_method, *args),
+                args=("start_async", execute_method, *args),
             )
-            self._prepare_async_task_id = task_id
+            self._prepare_async_method = execute_method
             self._prepare_async_last_poll = 0.0
             return False
 
-        if self._prepare_async_task_id != task_id:
+        if self._prepare_async_method != execute_method:
             raise RuntimeError(
-                "Elastic EP prepare async task is already active: "
-                f"{self._prepare_async_task_id}"
+                "Elastic EP prepare async method is already active: "
+                f"{self._prepare_async_method}"
             )
 
         now = time.monotonic()
@@ -180,12 +170,14 @@ class ElasticEPScalingState:
             return False
         self._prepare_async_last_poll = now
 
-        done = self._collective_rpc("elastic_ep_execute", args=("poll_async", task_id))
+        done = self._collective_rpc(
+            "elastic_ep_execute", args=("poll_async", execute_method)
+        )
         if not all(done):
             return False
 
-        self._collective_rpc("elastic_ep_execute", args=("clear_async", task_id))
-        self._prepare_async_task_id = None
+        self._collective_rpc("elastic_ep_execute", args=("clear_async", execute_method))
+        self._prepare_async_method = None
         return True
 
     def progress(self) -> bool:
