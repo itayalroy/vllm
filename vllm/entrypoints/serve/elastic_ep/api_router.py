@@ -87,6 +87,52 @@ async def scale_elastic_ep(raw_request: Request):
         set_scaling_elastic_ep(False)
 
 
+@router.post(
+    "/prepare_elastic_ep",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+async def prepare_elastic_ep(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+
+    new_data_parallel_size = body.get("new_data_parallel_size")
+
+    if new_data_parallel_size is None:
+        raise HTTPException(
+            status_code=400, detail="new_data_parallel_size is required"
+        )
+
+    if not isinstance(new_data_parallel_size, int) or new_data_parallel_size <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="new_data_parallel_size must be a positive integer",
+        )
+
+    client = engine_client(raw_request)
+    try:
+        await client.prepare_elastic_ep(new_data_parallel_size)
+        return JSONResponse(
+            {
+                "message": (
+                    "Prepared scale up to "
+                    f"{new_data_parallel_size} data parallel engines"
+                ),
+            }
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error("Prepare failed: %s", e)
+        raise HTTPException(status_code=500, detail="Prepare failed") from e
+
+
 @router.post("/is_scaling_elastic_ep")
 async def is_scaling_elastic_ep(raw_request: Request):
     return JSONResponse({"is_scaling_elastic_ep": get_scaling_elastic_ep()})

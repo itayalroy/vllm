@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
 import gc
+import threading
+import traceback
 import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
@@ -145,6 +147,12 @@ class ElasticEPScalingExecutor:
         self.worker_ref = weakref.ref(worker)
         self.reconfig_request = None
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
+        self._async_lock = threading.Lock()
+        self._async_task_id: str | None = None
+        self._async_thread: threading.Thread | None = None
+        self._async_done = False
+        self._async_error: BaseException | None = None
+        self._async_traceback: str | None = None
 
     @property
     def worker(self):
@@ -158,6 +166,90 @@ class ElasticEPScalingExecutor:
         if method is None:
             raise ValueError(f"Unknown execute method: {execute_method}")
         return method(*args, **kwargs)
+
+    def start_async(self, task_id: str, execute_method: str, *args, **kwargs) -> None:
+        with self._async_lock:
+            if self._async_task_id is not None:
+                if self._async_task_id == task_id:
+                    return
+                raise RuntimeError(
+                    f"Elastic EP async task is already active: {self._async_task_id}"
+                )
+
+            self._async_task_id = task_id
+            self._async_done = False
+            self._async_error = None
+            self._async_traceback = None
+            self._async_thread = threading.Thread(
+                target=self._run_async,
+                args=(task_id, execute_method, args, kwargs),
+                daemon=True,
+                name=f"ElasticEPAsync-{execute_method}",
+            )
+            self._async_thread.start()
+
+    def poll_async(self, task_id: str) -> bool:
+        with self._async_lock:
+            if self._async_task_id != task_id:
+                raise RuntimeError(
+                    "Elastic EP async task mismatch: "
+                    f"expected {self._async_task_id}, got {task_id}"
+                )
+            done = self._async_done
+            error = self._async_error
+            error_traceback = self._async_traceback
+
+        if error is not None:
+            raise RuntimeError(
+                f"Elastic EP async task {task_id} failed:\n{error_traceback}"
+            ) from error
+        return done
+
+    def clear_async(self, task_id: str) -> None:
+        with self._async_lock:
+            if self._async_task_id != task_id:
+                raise RuntimeError(
+                    "Elastic EP async task mismatch: "
+                    f"expected {self._async_task_id}, got {task_id}"
+                )
+            if not self._async_done:
+                raise RuntimeError(f"Elastic EP async task {task_id} is not done")
+            thread = self._async_thread
+            self._async_task_id = None
+            self._async_thread = None
+            self._async_done = False
+            self._async_error = None
+            self._async_traceback = None
+        if thread is not None:
+            thread.join(timeout=0)
+
+    def _run_async(
+        self,
+        task_id: str,
+        execute_method: str,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        try:
+            from vllm.platforms import current_platform
+
+            self.worker.vllm_config.enable_trace_function_call_for_thread()
+            if hasattr(self.worker, "device"):
+                current_platform.set_device(self.worker.device)
+            with set_current_vllm_config(self.worker.vllm_config):
+                self.execute(execute_method, *args, **kwargs)
+        except BaseException as e:
+            logger.exception("[Elastic EP] Async worker task %s failed", task_id)
+            with self._async_lock:
+                if self._async_task_id == task_id:
+                    self._async_error = e
+                    self._async_traceback = traceback.format_exc()
+                    self._async_done = True
+            return
+
+        with self._async_lock:
+            if self._async_task_id == task_id:
+                self._async_done = True
 
     def _set_eplb_suppressed(self, suppressed: bool) -> None:
         self.worker.model_runner.eep_eplb_suppressed = suppressed

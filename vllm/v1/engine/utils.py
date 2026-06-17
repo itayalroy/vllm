@@ -801,7 +801,11 @@ class CoreEngineActorManager:
         return placement_groups, local_dp_ranks
 
     def scale_up_elastic_ep(
-        self, cur_vllm_config: VllmConfig, new_data_parallel_size: int
+        self,
+        cur_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
+        update_current_config: bool = True,
+        wait_for_init: bool = True,
     ) -> None:
         import copy
 
@@ -886,38 +890,28 @@ class CoreEngineActorManager:
             self.created_placement_groups.append(pg)
             self.placement_group_is_local.append(local_client)
 
-        ray.get(
-            [
-                actor.wait_for_init.remote()
-                for actor in (
-                    self.local_engine_actors[-new_local_engines:]
-                    if new_local_engines > 0
-                    else []
-                )
-                + self.remote_engine_actors[
-                    -(len(placement_groups) - new_local_engines) :
-                ]
-            ]
-        )
-
         actors = (
             self.local_engine_actors[-new_local_engines:]
             if new_local_engines > 0
             else []
         ) + self.remote_engine_actors[-(len(placement_groups) - new_local_engines) :]
 
+        if wait_for_init:
+            ray.get([actor.wait_for_init.remote() for actor in actors])
+
         for actor in actors:
             ref = actor.run.remote()
             self.run_refs.append(ref)
             self.actor_run_ref_dict[actor] = ref
 
-        cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-        # Update old_vllm_config with new data_parallel_size_local if any new
-        # local engines were added
-        if new_local_engines > 0:
-            cur_vllm_config.parallel_config.data_parallel_size_local += (
-                new_local_engines
-            )
+        if update_current_config:
+            cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+            # Update old_vllm_config with new data_parallel_size_local if any new
+            # local engines were added
+            if new_local_engines > 0:
+                cur_vllm_config.parallel_config.data_parallel_size_local += (
+                    new_local_engines
+                )
 
     def scale_down_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int

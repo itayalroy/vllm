@@ -1041,6 +1041,20 @@ class AsyncLLM(EngineClient):
         finally:
             set_scaling_elastic_ep(False)
 
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+        """
+        Prepare a scale-up by launching new engine cores and staging Elastic EP
+        state without blocking request admission.
+        """
+        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if new_data_parallel_size <= old_data_parallel_size:
+            raise ValueError(
+                "prepare_elastic_ep only supports scale up to a larger "
+                "data parallel size"
+            )
+
+        await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
+
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
