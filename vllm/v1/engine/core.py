@@ -2053,73 +2053,69 @@ class DPEngineCoreProc(EngineCoreProc):
         )
 
     def reinitialize_distributed(
-        self, reconfig_request: ReconfigureDistributedRequest
-    ) -> None:
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        prepare_mode: bool = False,
+    ) -> Future[None] | None:
+        state = self._make_elastic_ep_scaling_state(
+            reconfig_request, prepare_mode=prepare_mode
+        )
         with self.eep_state_lock:
             if (
                 self.eep_scaling_state is not None
                 or self.eep_prepared_scaling_state is not None
             ):
                 raise RuntimeError("Elastic EP reconfiguration is already active")
-            self.eep_scaling_state = self._make_elastic_ep_scaling_state(
-                reconfig_request
-            )
+
+            if prepare_mode:
+                if state.scale_type != "scale_up" or state.worker_type != "existing":
+                    raise ValueError(
+                        "Elastic EP prepare is only supported for scale up"
+                    )
+                state.handle_notification(
+                    EEPNotificationType.NEW_CORE_ENGINES_INIT_READY
+                )
+                future: Future[None] = Future()
+                self.eep_prepared_scaling_state = state
+                self.eep_prepare_error = None
+                self.eep_prepare_thread = threading.Thread(
+                    target=self._run_elastic_ep_prepare,
+                    args=(future,),
+                    daemon=True,
+                    name="ElasticEPPrepare",
+                )
+                self.eep_prepare_thread.start()
+                logger.info("[Elastic EP] Started background scale-up preparation")
+                return future
+
+            self.eep_scaling_state = state
+
         self.process_input_queue_block = False
         logger.info(
             "[Elastic EP] Received reconfiguration request and starting scaling up/down"
         )
+        return None
 
-    def prepare_distributed(
-        self, reconfig_request: ReconfigureDistributedRequest
-    ) -> None:
-        state = self._make_elastic_ep_scaling_state(reconfig_request, prepare_mode=True)
-        if state.scale_type != "scale_up" or state.worker_type != "existing":
-            raise ValueError("Elastic EP prepare is only supported for scale up")
-
-        with self.eep_state_lock:
-            if (
-                self.eep_scaling_state is not None
-                or self.eep_prepared_scaling_state is not None
-            ):
-                raise RuntimeError("Elastic EP reconfiguration is already active")
-            # Prepare helpers should wait in the standby rendezvous before
-            # newly launched actors try to join it.
-            state.start_prepared_scale_up()
-            self.eep_prepared_scaling_state = state
-            self.eep_prepare_error = None
-            self.eep_prepare_thread = threading.Thread(
-                target=self._run_elastic_ep_prepare,
-                daemon=True,
-                name="ElasticEPPrepare",
-            )
-            self.eep_prepare_thread.start()
-
-        self.process_input_queue_block = False
-        logger.info("[Elastic EP] Started background scale-up preparation")
-
-    def _run_elastic_ep_prepare(self) -> None:
+    def _run_elastic_ep_prepare(self, future: Future[None]) -> None:
         try:
             while True:
                 with self.eep_state_lock:
                     state = self.eep_prepared_scaling_state
                     if state is None:
-                        return
+                        raise RuntimeError("Elastic EP prepared state was cleared")
                     if state.is_ready_for_switch():
                         break
-                with self.eep_state_lock:
-                    state = self.eep_prepared_scaling_state
-                    if state is None:
-                        return
-                    if not state.is_ready_for_switch():
-                        state.progress()
+                    state.progress()
                 time.sleep(0.001)
 
-            assert state is not None
-            state.notify_prepared_for_switch()
             logger.info("[Elastic EP] Background scale-up preparation completed")
+            if not future.done():
+                future.set_result(None)
         except Exception as e:
             self.eep_prepare_error = e
             logger.exception("[Elastic EP] Background scale-up preparation failed")
+            if not future.done():
+                future.set_exception(e)
 
     def finish_prepared_elastic_ep(self) -> None:
         with self.eep_state_lock:

@@ -274,27 +274,6 @@ class ElasticEPScalingState:
             dp_store.compare_set(sync_key, "", b"1")
             return False
 
-    def _store_barrier(self, use_new_group: bool, barrier_name: str) -> None:
-        dp_group = self.new_dp_group if use_new_group else self.old_dp_group
-        dp_store = self.new_dp_store if use_new_group else self.old_dp_store
-        assert dp_group is not None and dp_store is not None
-
-        suffix = (
-            self.reconfig_request.coord_store_port
-            if self.reconfig_request is not None
-            else id(self)
-        )
-        barrier_id = f"eep_store_barrier_{barrier_name}_{suffix}"
-        self._execute_tcp_store_barrier(
-            dp_store, dp_group.rank(), dp_group.size(), barrier_id
-        )
-
-    def _pre_switch_barrier(self, use_new_group: bool, barrier_name: str) -> bool:
-        if self.prepare_mode:
-            self._store_barrier(use_new_group, barrier_name)
-            return True
-        return self._staged_barrier(use_new_group, barrier_name)
-
     def _progress_existing_engine(self) -> bool:
         state = self.state
         assert self.old_dp_group is not None and self.old_dp_store is not None
@@ -304,13 +283,15 @@ class ElasticEPScalingState:
 
         elif state == ScaleUpExistingEngineState.CREATE_STANDBY_GROUPS:
             # NOTE(yongji): wait for all existing workers to receive the request
-            if not self._is_prepare_async_active("create_standby_groups"):
+            if not self.prepare_mode and not self._is_prepare_async_active(
+                "create_standby_groups"
+            ):
                 if (
                     int(self.old_dp_store.get("eep_barrier_engine_count"))
                     < self.old_dp_group.size()
                 ):
                     return False
-                if not self._pre_switch_barrier(
+                if not self._staged_barrier(
                     use_new_group=False, barrier_name="create_standby_groups"
                 ):
                     return False
@@ -331,13 +312,15 @@ class ElasticEPScalingState:
             return False
 
         elif state == ScaleUpExistingEngineState.TRANSFER_WEIGHTS:
-            if not self._is_prepare_async_active("transfer_weights"):
+            if not self.prepare_mode and not self._is_prepare_async_active(
+                "transfer_weights"
+            ):
                 if (
                     int(self.old_dp_store.get("eep_barrier_engine_count"))
                     < self.old_dp_group.size()
                 ):
                     return False
-                if not self._pre_switch_barrier(
+                if not self._staged_barrier(
                     use_new_group=False, barrier_name="transfer_weights"
                 ):
                     return False
@@ -521,31 +504,12 @@ class ElasticEPScalingState:
             self.old_dp_store.add("eep_barrier_engine_count", 1)
             self.state = ScaleUpExistingEngineState.TRANSFER_WEIGHTS
 
-    def start_prepared_scale_up(self) -> None:
-        assert self.prepare_mode
-        assert self.scale_type == "scale_up"
-        assert self.worker_type == "existing"
-        assert self.old_dp_store is not None
-        assert self.state == ScaleUpExistingEngineState.WAIT_NEW_CORE_ENGINES_INIT
-        self.old_dp_store.add("eep_barrier_engine_count", 1)
-        self.state = ScaleUpExistingEngineState.CREATE_STANDBY_GROUPS
-
     def is_ready_for_switch(self) -> bool:
         return (
             self.scale_type == "scale_up"
             and self.worker_type == "existing"
             and self.state == ScaleUpExistingEngineState.SWITCH_AND_PREPARE
         )
-
-    def notify_prepared_for_switch(self) -> None:
-        assert self.prepare_mode
-        assert self.old_dp_group is not None
-        assert self.is_ready_for_switch()
-        self._store_barrier(use_new_group=False, barrier_name="prepared_for_switch")
-        if self.old_dp_group.rank() == 0:
-            self.engine_core._eep_send_engine_core_notification(
-                EEPNotificationType.RECONFIGURE_PREPARED
-            )
 
     def is_complete(self) -> bool:
         if self.scale_type == "scale_up":

@@ -1482,10 +1482,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 f"Unknown EEP notification type: {notification_type_str}"
             ) from e
 
-        if notification_type in (
-            EEPNotificationType.RECONFIGURE_FINISHED,
-            EEPNotificationType.RECONFIGURE_PREPARED,
-        ):
+        if notification_type == EEPNotificationType.RECONFIGURE_FINISHED:
             from vllm.v1.engine import UtilityResult
 
             # NOTE(yongji): process a dummy UtilityOutput to resolve the future
@@ -1601,27 +1598,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             cur_data_parallel_size, new_data_parallel_size, prepare_only=True
         )
 
-    async def _eep_wait_for_reconfigure_notification(
-        self, notification_type: EEPNotificationType
-    ) -> None:
-        """
-        Wait for an Elastic EP reconfiguration notification.
-
-        In eep_process_engine_core_notification(), a dummy UtilityOutput with
-        EEP_NOTIFICATION_CALL_ID will be set when the requested notification is
-        received from engine 0. We create a future with that call_id and wait
-        for it to be resolved.
-        """
-        del notification_type
+    async def _eep_wait_for_setup_switch_complete(self) -> None:
+        """Wait for core engines to switch to the new setup."""
         future = asyncio.get_running_loop().create_future()
         self.utility_results[EEP_NOTIFICATION_CALL_ID] = future
         self._ensure_output_queue_task()
         await future
-
-    async def _eep_wait_for_setup_switch_complete(self) -> None:
-        await self._eep_wait_for_reconfigure_notification(
-            EEPNotificationType.RECONFIGURE_FINISHED
-        )
 
     def _wait_for_new_engine_ready(self, new_core_engines: list[bytes]) -> None:
         new_engine_identities = set(new_core_engines)
@@ -1682,21 +1664,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         parallel_config = self.vllm_config.parallel_config
         ip, coord_store_port = self._setup_elastic_ep_reconfig_bootstrap()
-        wait_notification = (
-            EEPNotificationType.RECONFIGURE_PREPARED
-            if prepare_only
-            else EEPNotificationType.RECONFIGURE_FINISHED
-        )
-        wait_task = asyncio.create_task(
-            self._eep_wait_for_reconfigure_notification(wait_notification)
-        )
-        await asyncio.sleep(0)
+        wait_task = None
+        if not prepare_only:
+            wait_task = asyncio.create_task(self._eep_wait_for_setup_switch_complete())
+            await asyncio.sleep(0)
 
         # Phase 1: Send reconfig messages to existing engines
         reconfig_futures = []
-        reconfig_method = (
-            "prepare_distributed" if prepare_only else "reinitialize_distributed"
-        )
         for engine in self.core_engines:
             reconfig_request = ReconfigureDistributedRequest(
                 new_data_parallel_size=new_data_parallel_size,
@@ -1708,7 +1682,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 coord_store_port=coord_store_port,
             )
             coro = self._call_utility_async(
-                reconfig_method, reconfig_request, engine=engine
+                "reinitialize_distributed",
+                reconfig_request,
+                prepare_only,
+                engine=engine,
             )
             reconfig_futures.append(asyncio.create_task(coro))
 
@@ -1731,7 +1708,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         try:
             await asyncio.gather(start_new_worker_future, *reconfig_futures)
         except Exception:
-            wait_task.cancel()
+            if wait_task is not None:
+                wait_task.cancel()
             self.utility_results.pop(EEP_NOTIFICATION_CALL_ID, None)
             raise
         logger.info("[Elastic EP] Successfully started new engines")
@@ -1745,7 +1723,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if not prepare_only:
             self._wait_for_new_engine_ready(new_core_engines)
 
-        await wait_task
+        if wait_task is not None:
+            await wait_task
         if prepare_only:
             self.prepared_elastic_scale_up = PreparedElasticScaleUp(
                 target_data_parallel_size=new_data_parallel_size,
