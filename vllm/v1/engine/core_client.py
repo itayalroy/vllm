@@ -1710,7 +1710,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 self.resources.engine_manager.scale_up_elastic_ep,
                 scale_up_vllm_config,
                 new_data_parallel_size,
-                update_current_config=not prepare_only,
                 wait_for_init=not prepare_only,
             )
         )

@@ -804,7 +804,6 @@ class CoreEngineActorManager:
         self,
         cur_vllm_config: VllmConfig,
         new_data_parallel_size: int,
-        update_current_config: bool = True,
         wait_for_init: bool = True,
     ) -> None:
         import copy
@@ -904,14 +903,13 @@ class CoreEngineActorManager:
             self.run_refs.append(ref)
             self.actor_run_ref_dict[actor] = ref
 
-        if update_current_config:
-            cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-            # Update old_vllm_config with new data_parallel_size_local if any new
-            # local engines were added
-            if new_local_engines > 0:
-                cur_vllm_config.parallel_config.data_parallel_size_local += (
-                    new_local_engines
-                )
+        cur_vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+        # Update old_vllm_config with new data_parallel_size_local if any new
+        # local engines were added
+        if new_local_engines > 0:
+            cur_vllm_config.parallel_config.data_parallel_size_local += (
+                new_local_engines
+            )
 
     def scale_down_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
