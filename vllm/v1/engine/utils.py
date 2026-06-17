@@ -930,24 +930,6 @@ class CoreEngineActorManager:
                 self.remote_engine_actors.pop()
             ray.util.remove_placement_group(pg)
 
-    def rollback_scale_up_elastic_ep(self, data_parallel_size: int) -> None:
-        import ray
-
-        while (
-            len(self.local_engine_actors) + len(self.remote_engine_actors)
-            > data_parallel_size
-        ):
-            pg = self.created_placement_groups.pop()
-            is_local = self.placement_group_is_local.pop()
-            if is_local:
-                actor = self.local_engine_actors.pop()
-            else:
-                actor = self.remote_engine_actors.pop()
-            ref = self.actor_run_ref_dict.pop(actor, None)
-            if ref is not None and ref in self.run_refs:
-                self.run_refs.remove(ref)
-            ray.util.remove_placement_group(pg)
-
     def remove_run_refs_for_scale_down(self, removed_dp_size: int) -> None:
         if removed_dp_size <= 0:
             return

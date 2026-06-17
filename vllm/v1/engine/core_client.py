@@ -1728,9 +1728,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             self.eep_scaling_cache = None
             if prepare_only:
                 self.prepared_elastic_scale_up = None
-                self.resources.engine_manager.rollback_scale_up_elastic_ep(
-                    cur_data_parallel_size
-                )
             raise
         logger.info("[Elastic EP] Successfully started new engines")
 
