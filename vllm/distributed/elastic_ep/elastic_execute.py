@@ -25,6 +25,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.distributed.elastic_ep.async_utils import SingleMethodAsyncRunner
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
@@ -145,6 +146,7 @@ class ElasticEPScalingExecutor:
         self.worker_ref = weakref.ref(worker)
         self.reconfig_request = None
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
+        self._async_runner = SingleMethodAsyncRunner()
 
     @property
     def worker(self):
@@ -158,6 +160,24 @@ class ElasticEPScalingExecutor:
         if method is None:
             raise ValueError(f"Unknown execute method: {execute_method}")
         return method(*args, **kwargs)
+
+    def start_async(self, execute_method: str, *args, **kwargs) -> None:
+        self._async_runner.start(execute_method, self._run_async, *args, **kwargs)
+
+    def poll_async(self, execute_method: str) -> bool:
+        return self._async_runner.poll(execute_method)
+
+    def clear_async(self, execute_method: str) -> None:
+        self._async_runner.clear(execute_method)
+
+    def _run_async(self, execute_method: str, *args, **kwargs) -> None:
+        from vllm.platforms import current_platform
+
+        self.worker.vllm_config.enable_trace_function_call_for_thread()
+        if hasattr(self.worker, "device"):
+            current_platform.set_device(self.worker.device)
+        with set_current_vllm_config(self.worker.vllm_config):
+            self.execute(execute_method, *args, **kwargs)
 
     def _set_eplb_suppressed(self, suppressed: bool) -> None:
         self.worker.model_runner.eep_eplb_suppressed = suppressed
@@ -498,23 +518,6 @@ class ElasticEPScalingExecutor:
             compilation_counter.stock_torch_compile_count += 1
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
 
-        multi_block_table = self.worker.model_runner.input_batch.block_table
-        saved_block_tables: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for bt in multi_block_table.block_tables:
-            saved_block_tables.append(
-                (bt.block_table.gpu.clone(), bt.block_table.cpu.clone())
-            )
-        multi_block_table.clear()
-
-        unlock_workspace()
-        self.worker.compile_or_warm_up_model()
-        lock_workspace()
-
-        for bt, (saved_gpu, saved_cpu) in zip(
-            multi_block_table.block_tables, saved_block_tables
-        ):
-            bt.block_table.gpu.copy_(saved_gpu)
-            bt.block_table.cpu.copy_(saved_cpu)
         if new_dp_size < old_dp_size:
             self._set_eplb_suppressed(False)
 
@@ -641,14 +644,13 @@ class ElasticEPScalingExecutor:
         with set_current_vllm_config(self.worker.vllm_config):
             prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
 
-    def rewarm_workspace(self) -> None:
+    def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
         # coordinate_batch_across_dp whenever data_parallel_size > 1
         # (gpu_model_runner.py:3663), which deadlocks if any rank skips it.
 
-        # Save and clear block tables so profile_run/compile_or_warm_up_model
-        # don't write dummy slot mappings into real KV-cache blocks (mirrors
-        # switch_and_prepare's pattern).
+        # Save and clear block tables so the dummy MoE forward doesn't
+        # write dummy slot mappings into real KV-cache blocks.
         multi_block_table = self.worker.model_runner.input_batch.block_table
         saved_block_tables: list[tuple[torch.Tensor, torch.Tensor]] = []
         for bt in multi_block_table.block_tables:
@@ -658,19 +660,16 @@ class ElasticEPScalingExecutor:
         multi_block_table.clear()
 
         # _ensure_workspace_size allocates a fresh tensor on grow, leaving
-        # captured CUDA graphs with stale data pointers; drop graphs before
-        # re-warm so captures realign with the resized buffer.
+        # any captured CUDA graph with a stale data pointer; drop graphs
+        # before re-warm so captures realign with the resized buffer.
         self._release_cuda_graphs()
         unlock_workspace()
 
-        # Grow the MoE workspace at max_num_tokens.
-        # compile_or_warm_up_model alone only exercises cudagraph-capture
-        # sizes (≤64 tokens for this test) and leaves the workspace at
-        # ~10-14 MB; the post-all-to-all per-rank token count under real
-        # post-reshuffle routing needs hundreds of MB. Use _dummy_run
-        # directly (rather than profile_run) with skip_eplb=True so dummy
-        # routing doesn't pollute the just-rebalanced EPLB stats — same
-        # convention compile_or_warm_up_model itself uses.
+        # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
+        # alone only exercises cudagraph-capture sizes and can leave the
+        # workspace too small for post-reshuffle routing. Use _dummy_run
+        # directly with skip_eplb=True so dummy routing doesn't pollute the
+        # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
         self.worker.compile_or_warm_up_model()

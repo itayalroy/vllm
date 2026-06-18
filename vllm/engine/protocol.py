@@ -224,6 +224,10 @@ class EngineClient(ABC):
         """Scale the engine"""
         raise NotImplementedError
 
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+        """Prepare an Elastic EP scale-up without switching traffic."""
+        raise NotImplementedError
+
     async def collective_rpc(
         self,
         method: str,

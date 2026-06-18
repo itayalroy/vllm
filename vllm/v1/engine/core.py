@@ -317,8 +317,9 @@ class EngineCore:
 
         vllm_config.validate_block_size()
 
-        # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
+        if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            self.model_executor.compile_or_warm_up_model()
 
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time
@@ -1776,6 +1777,10 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
+        self.eep_prepared_scaling_state: ElasticEPScalingState | None = None
+        self.eep_prepare_error: BaseException | None = None
+        self.eep_state_lock = threading.Lock()
+        self.eep_executor_lock = threading.Lock()
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -1929,14 +1934,18 @@ class DPEngineCoreProc(EngineCoreProc):
             self._maybe_publish_request_counts()
 
             if self.eep_scaling_state is not None:
-                _ = self.eep_scaling_state.progress()
-                if self.eep_scaling_state.is_complete():
-                    if self.eep_scaling_state.worker_type == "removing":
+                with self.eep_state_lock:
+                    _ = self.eep_scaling_state.progress()
+                    scaling_complete = self.eep_scaling_state.is_complete()
+                    worker_type = self.eep_scaling_state.worker_type
+                if scaling_complete:
+                    if worker_type == "removing":
                         raise SystemExit
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
 
-            executed = self._process_engine_step()
+            with self.eep_executor_lock:
+                executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()
@@ -1947,7 +1956,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                with self.log_iteration_details(None):
+                with self.log_iteration_details(None), self.eep_executor_lock:
                     self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
@@ -1997,8 +2006,10 @@ class DPEngineCoreProc(EngineCoreProc):
         return has_unfinished
 
     def reinitialize_distributed(
-        self, reconfig_request: ReconfigureDistributedRequest
-    ) -> None:
+        self,
+        reconfig_request: ReconfigureDistributedRequest,
+        prepare_mode: bool = False,
+    ) -> Future[None] | None:
         from copy import deepcopy
 
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
@@ -2030,7 +2041,7 @@ class DPEngineCoreProc(EngineCoreProc):
             == ReconfigureRankType.SHUTDOWN_CURRENT_RANK
         )
 
-        self.eep_scaling_state = ElasticEPScalingState(
+        state = ElasticEPScalingState(
             model_executor=self.model_executor,
             engine_core=self,
             vllm_config=self.vllm_config,
@@ -2038,11 +2049,81 @@ class DPEngineCoreProc(EngineCoreProc):
             worker_type="removing" if is_shutdown else "existing",
             scale_type="scale_down" if is_scale_down else "scale_up",
             reconfig_request=reconfig_request,
+            prepare_mode=prepare_mode,
         )
+
+        with self.eep_state_lock:
+            if (
+                self.eep_scaling_state is not None
+                or self.eep_prepared_scaling_state is not None
+            ):
+                raise RuntimeError("Elastic EP reconfiguration is already active")
+
+            if prepare_mode:
+                if state.worker_type != "existing":
+                    raise ValueError(
+                        "Background Elastic EP prepare is only valid for existing ranks"
+                    )
+                if state.scale_type == "scale_up":
+                    state.handle_notification(
+                        EEPNotificationType.NEW_CORE_ENGINES_INIT_READY
+                    )
+                future: Future[None] = Future()
+                self.eep_prepared_scaling_state = state
+                self.eep_prepare_error = None
+                prepare_thread = threading.Thread(
+                    target=self._run_elastic_ep_prepare,
+                    args=(future,),
+                    daemon=True,
+                    name="ElasticEPPrepare",
+                )
+                prepare_thread.start()
+                logger.info("[Elastic EP] Started background preparation")
+                return future
+
+            self.eep_scaling_state = state
+
         self.process_input_queue_block = False
         logger.info(
             "[Elastic EP] Received reconfiguration request and starting scaling up/down"
         )
+        return None
+
+    def _run_elastic_ep_prepare(self, future: Future[None]) -> None:
+        try:
+            while True:
+                with self.eep_state_lock:
+                    state = self.eep_prepared_scaling_state
+                    if state is None:
+                        raise RuntimeError("Elastic EP prepared state was cleared")
+                    if state.is_ready_for_switch():
+                        break
+                    state.progress()
+                time.sleep(0.001)
+
+            logger.info("[Elastic EP] Background preparation completed")
+            if not future.done():
+                future.set_result(None)
+        except Exception as e:
+            self.eep_prepare_error = e
+            logger.exception("[Elastic EP] Background scale-up preparation failed")
+            if not future.done():
+                future.set_exception(e)
+
+    def finish_prepared_elastic_ep(self) -> None:
+        with self.eep_state_lock:
+            if self.eep_prepare_error is not None:
+                raise RuntimeError(
+                    "Elastic EP background preparation failed"
+                ) from self.eep_prepare_error
+            state = self.eep_prepared_scaling_state
+            if state is None or not state.is_ready_for_switch():
+                raise RuntimeError("No prepared Elastic EP reconfiguration is ready")
+            state.prepare_mode = False
+            self.eep_scaling_state = state
+            self.eep_prepared_scaling_state = None
+        self.process_input_queue_block = False
+        logger.info("[Elastic EP] Finishing prepared reconfiguration")
 
     def _eep_send_engine_core_notification(
         self,
@@ -2091,10 +2172,12 @@ class DPEngineCoreProc(EngineCoreProc):
         Handle notification received from EngineCoreClient
         (forwarded from new core engines).
         """
-        assert self.eep_scaling_state is not None
         if isinstance(notification_type, str):
             notification_type = EEPNotificationType(notification_type)
-        self.eep_scaling_state.handle_notification(notification_type)
+        with self.eep_state_lock:
+            state = self.eep_scaling_state or self.eep_prepared_scaling_state
+            assert state is not None
+            state.handle_notification(notification_type)
 
     def _eep_scale_up_before_kv_init(self):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState

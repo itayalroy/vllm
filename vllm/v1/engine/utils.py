@@ -801,7 +801,9 @@ class CoreEngineActorManager:
         return placement_groups, local_dp_ranks
 
     def scale_up_elastic_ep(
-        self, cur_vllm_config: VllmConfig, new_data_parallel_size: int
+        self,
+        cur_vllm_config: VllmConfig,
+        new_data_parallel_size: int,
     ) -> None:
         import copy
 
@@ -885,20 +887,6 @@ class CoreEngineActorManager:
                 self.remote_engine_actors.append(actor)
             self.created_placement_groups.append(pg)
             self.placement_group_is_local.append(local_client)
-
-        ray.get(
-            [
-                actor.wait_for_init.remote()
-                for actor in (
-                    self.local_engine_actors[-new_local_engines:]
-                    if new_local_engines > 0
-                    else []
-                )
-                + self.remote_engine_actors[
-                    -(len(placement_groups) - new_local_engines) :
-                ]
-            ]
-        )
 
         actors = (
             self.local_engine_actors[-new_local_engines:]
