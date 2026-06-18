@@ -172,9 +172,19 @@ def _run_prepare_then_scale_timing(
         assert prepare_ok, f"prepare_elastic_ep failed with status {prepare_status}"
         assert served_during_prepare, "prepare completed before serving was checked"
 
+        status_code = _send_liveness_completion(server)
+        last_completion_at = time.perf_counter()
+        assert status_code == 200
+
         scale_ok, switch_seconds, scale_status = _post_elastic_ep_command_timed(
             server, "scale_elastic_ep", target_dp_size
         )
+        downtime_seconds = float("nan")
+        if scale_ok:
+            status_code = _send_liveness_completion(server)
+            first_completion_after_switch_at = time.perf_counter()
+            assert status_code == 200
+            downtime_seconds = first_completion_after_switch_at - last_completion_at
         total_seconds = time.perf_counter() - total_start
 
         mode = "enforce_eager" if enforce_eager else "cuda_graphs"
@@ -182,6 +192,7 @@ def _run_prepare_then_scale_timing(
             f"[Elastic EP timing][{initial_dp_size}->{target_dp_size}][{mode}] "
             f"prepare_seconds={prepare_seconds:.3f} "
             f"switch_seconds={switch_seconds:.3f} "
+            f"downtime_seconds={downtime_seconds:.3f} "
             f"total_seconds={total_seconds:.3f}"
         )
 
