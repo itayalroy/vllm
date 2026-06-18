@@ -447,6 +447,7 @@ class ElasticEPScalingState:
             # e.g., to drain in-batch requests.
             self._create_standby_groups()
             self._switch_and_prepare()
+            self._collective_rpc("elastic_ep_execute", args=("warm_and_capture",))
             self._update_parallel_config()
             self.state = ScaleDownRemainingEngineState.COMPLETE
             return True
@@ -597,9 +598,7 @@ class ElasticEPScalingState:
 
     def _eplb_reshuffle(self):
         self._collective_rpc("elastic_ep_execute", args=("perform_eplb_reshuffle",))
-        # Reshuffle changes per-rank token routing; the locked MoE workspace
-        # may now be too small. Rewarm covers both new and existing engines.
-        self._collective_rpc("elastic_ep_execute", args=("rewarm_workspace",))
+        self._collective_rpc("elastic_ep_execute", args=("warm_and_capture",))
         assert self.new_dp_group is not None
         if self.new_dp_group.rank() == 0:
             logger.info("[Elastic EP] EPLB reshuffle completed")
