@@ -145,6 +145,12 @@ class ElasticEPScalingState:
     def _is_prepare_async_active(self, execute_method: str) -> bool:
         return self._prepare_async_method == execute_method
 
+    def _old_dp_wave_drained(self) -> bool:
+        return (
+            not self.engine_core.engines_running
+            and not self.engine_core.scheduler.has_requests()
+        )
+
     def _elastic_ep_execute(self, execute_method: str, *args) -> bool:
         if not self.prepare_mode:
             self._collective_rpc("elastic_ep_execute", args=(execute_method, *args))
@@ -337,6 +343,8 @@ class ElasticEPScalingState:
             return True
 
         elif state == ScaleUpExistingEngineState.SWITCH_AND_PREPARE:
+            if not self._old_dp_wave_drained():
+                return False
             self._switch_and_prepare()
             self.state = ScaleUpExistingEngineState.EPLB_RESHUFFLE
             assert self.new_dp_store is not None
