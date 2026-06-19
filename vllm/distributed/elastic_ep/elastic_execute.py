@@ -161,16 +161,27 @@ class ElasticEPScalingExecutor:
             raise ValueError(f"Unknown execute method: {execute_method}")
         return method(*args, **kwargs)
 
-    def start_async(self, execute_method: str, *args, **kwargs) -> None:
-        self._async_runner.start(execute_method, self._run_async, *args, **kwargs)
-
-    def poll_async(self, execute_method: str) -> bool:
-        return self._async_runner.poll(execute_method)
+    def start_async(self, execute_method: str, *args, **kwargs) -> str:
+        if args and isinstance(args[0], ReconfigureDistributedRequest):
+            self.reconfig_request = args[0]
+        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+        done_key = f"eep_async/{execute_method}/{dp_rank}/{self.worker.rank}"
+        self._async_runner.start(
+            execute_method, self._run_async, done_key, *args, **kwargs
+        )
+        return done_key
 
     def clear_async(self, execute_method: str) -> None:
         self._async_runner.clear(execute_method)
 
-    def _run_async(self, execute_method: str, *args, **kwargs) -> None:
+    def _run_async(
+        self,
+        execute_method: str,
+        done_key: str,
+        *args,
+        **kwargs,
+    ) -> None:
+        from vllm.distributed.utils import get_cached_tcp_store_client
         from vllm.platforms import current_platform
 
         self.worker.vllm_config.enable_trace_function_call_for_thread()
@@ -178,6 +189,14 @@ class ElasticEPScalingExecutor:
             current_platform.set_device(self.worker.device)
         with set_current_vllm_config(self.worker.vllm_config):
             self.execute(execute_method, *args, **kwargs)
+        assert self.reconfig_request is not None
+        get_cached_tcp_store_client(
+            self.reconfig_request.new_data_parallel_master_ip,
+            self.reconfig_request.coord_store_port,
+        ).set(
+            done_key,
+            b"1",
+        )
 
     def _set_eplb_suppressed(self, suppressed: bool) -> None:
         self.worker.model_runner.eep_eplb_suppressed = suppressed

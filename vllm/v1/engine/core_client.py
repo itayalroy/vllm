@@ -1616,6 +1616,21 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self._ensure_output_queue_task()
         await future
 
+    async def _eep_wait_for_ready_to_switch(
+        self, engines: list[EngineIdentity]
+    ) -> None:
+        while not all(
+            await asyncio.gather(
+                *(
+                    self._call_utility_async(
+                        "is_elastic_ep_ready_for_switch", engine=engine
+                    )
+                    for engine in engines
+                )
+            )
+        ):
+            await asyncio.sleep(0.05)
+
     def _wait_for_new_engine_ready(self, new_core_engines: list[bytes]) -> None:
         new_engine_identities = set(new_core_engines)
         sync_input_socket = zmq.Socket.shadow(self.input_socket)
@@ -1710,6 +1725,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # and reconfig messages to be received
         try:
             await asyncio.gather(start_new_worker_task, *reconfig_futures)
+            await self._eep_wait_for_ready_to_switch(self.core_engines)
         except Exception:
             if not start_new_worker_task.done():
                 with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -1758,6 +1774,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             reconfig_futures.append(asyncio.create_task(coro))
 
         await asyncio.gather(*reconfig_futures)
+        await self._eep_wait_for_ready_to_switch(
+            self.core_engines[:new_data_parallel_size]
+        )
         self.prepared_elastic_scale_down = new_data_parallel_size
         logger.info(
             "[Elastic EP] Prepared scale down to data parallel size %s",
@@ -1836,6 +1855,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         removed_dp_size = cur_data_parallel_size - new_data_parallel_size
         assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
         self.resources.engine_manager.remove_run_refs_for_scale_down(removed_dp_size)
+        wait_task = asyncio.create_task(self._eep_wait_for_setup_switch_complete())
+        await asyncio.sleep(0)
         reconfig_futures = []
         for cur_dp_rank, engine in enumerate(self.core_engines):
             reconfig_request = ReconfigureDistributedRequest(
@@ -1863,21 +1884,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # NOTE(yongji): Immediately stop sending requests to the removing engines.
         self.core_engines = self.core_engines[:new_data_parallel_size]
         self.lb_engines = self.lb_engines[:new_data_parallel_size]
-        wait_future = self._eep_wait_for_setup_switch_complete()
 
-        await asyncio.gather(*reconfig_futures)
+        try:
+            await asyncio.gather(*reconfig_futures)
 
-        self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-        self._ensure_stats_update_task()
-        scale_down_marker = msgspec.msgpack.encode(
-            ("SCALE_ELASTIC_EP", new_data_parallel_size)
-        )
-        await self.first_req_send_socket.send(scale_down_marker)
+            self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+            self._ensure_stats_update_task()
+            scale_down_marker = msgspec.msgpack.encode(
+                ("SCALE_ELASTIC_EP", new_data_parallel_size)
+            )
+            await self.first_req_send_socket.send(scale_down_marker)
+            await wait_task
+        except Exception:
+            wait_task.cancel()
+            self.utility_results.pop(EEP_NOTIFICATION_CALL_ID, None)
+            raise
 
-        # NOTE(yongji): Unlike scaling up,
-        # here we don't actually need to wait for the setup switch to complete.
-        # We may want to remove it in the future.
-        await wait_future
         logger.info(
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,

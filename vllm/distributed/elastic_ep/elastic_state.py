@@ -4,7 +4,7 @@ import enum
 import time
 import weakref
 from datetime import timedelta
-from typing import TYPE_CHECKING, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch.distributed
 
@@ -13,6 +13,7 @@ from vllm.distributed import (
     sched_yield,
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EEPNotificationType,
@@ -106,6 +107,8 @@ class ElasticEPScalingState:
         self.prepare_mode = prepare_mode
         self._prepare_async_method: str | None = None
         self._prepare_async_last_poll = 0.0
+        self._prepare_async_done_keys: list[str] | None = None
+        self._kv_cache_memory_sync: tuple[object, Any] | None = None
         self._standby_groups_created = False
 
         self.state: EngineState
@@ -137,11 +140,7 @@ class ElasticEPScalingState:
         return engine_core
 
     def _collective_rpc(self, *args, **kwargs):
-        with self.engine_core.eep_executor_lock:
-            return self.model_executor.collective_rpc(*args, **kwargs)
-
-    def _is_prepare_async_active(self, execute_method: str) -> bool:
-        return self._prepare_async_method == execute_method
+        return self.model_executor.collective_rpc(*args, **kwargs)
 
     def _old_dp_wave_drained(self) -> bool:
         return (
@@ -155,11 +154,12 @@ class ElasticEPScalingState:
             return True
 
         if self._prepare_async_method is None:
-            self._collective_rpc(
+            done_keys = self._collective_rpc(
                 "elastic_ep_execute",
                 args=("start_async", execute_method, *args),
             )
             self._prepare_async_method = execute_method
+            self._prepare_async_done_keys = list(done_keys)
             self._prepare_async_last_poll = 0.0
             return False
 
@@ -174,14 +174,18 @@ class ElasticEPScalingState:
             return False
         self._prepare_async_last_poll = now
 
-        done = self._collective_rpc(
-            "elastic_ep_execute", args=("poll_async", execute_method)
+        assert self.reconfig_request is not None
+        assert self._prepare_async_done_keys is not None
+        coord_store = get_cached_tcp_store_client(
+            self.reconfig_request.new_data_parallel_master_ip,
+            self.reconfig_request.coord_store_port,
         )
-        if not all(done):
+        if not coord_store.check(self._prepare_async_done_keys):
             return False
 
         self._collective_rpc("elastic_ep_execute", args=("clear_async", execute_method))
         self._prepare_async_method = None
+        self._prepare_async_done_keys = None
         return True
 
     def progress(self) -> bool:
@@ -307,11 +311,14 @@ class ElasticEPScalingState:
             return True
 
         elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:
-            self._sync_kv_cache_memory_size()
+            if not self._sync_kv_cache_memory_size():
+                return False
             self.state = ScaleUpExistingEngineState.SWITCH_AND_PREPARE
             return True
 
         elif state == ScaleUpExistingEngineState.SWITCH_AND_PREPARE:
+            if self.prepare_mode:
+                return False
             if not self._old_dp_wave_drained():
                 return False
             self._switch_and_prepare()
@@ -398,6 +405,8 @@ class ElasticEPScalingState:
 
         if state == ScaleDownRemainingEngineState.PREPARE:
             if self.prepare_mode:
+                if self._standby_groups_created:
+                    return False
                 return self._create_standby_groups()
             self.state = ScaleDownRemainingEngineState.EPLB_RESHUFFLE
             self.old_dp_store.add("eep_barrier_engine_count", 1)
@@ -511,7 +520,7 @@ class ElasticEPScalingState:
 
     def _create_standby_groups(self) -> bool:
         assert self.old_dp_group is not None
-        if not self._is_prepare_async_active("create_standby_groups"):
+        if self._prepare_async_method != "create_standby_groups":
             self.new_dp_group, self.new_dp_store = (
                 self.new_parallel_config.stateless_init_dp_group(return_store=True)
             )
@@ -541,15 +550,33 @@ class ElasticEPScalingState:
             logger.info("[Elastic EP] Broadcasted expert mapping to new workers")
         return True
 
-    def _sync_kv_cache_memory_size(self):
+    def _sync_kv_cache_memory_size(self) -> bool:
         assert self.engine_core.available_gpu_memory_for_kv_cache > 0
         assert self.new_dp_group is not None and self.old_dp_group is not None
-        ParallelConfig.sync_kv_cache_memory_size(
-            self.new_dp_group,
-            self.engine_core.available_gpu_memory_for_kv_cache,
-        )
+
+        if self._kv_cache_memory_sync is None:
+            tensor = torch.tensor(
+                [self.engine_core.available_gpu_memory_for_kv_cache],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            work = torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.new_dp_group,
+                async_op=True,
+            )
+            self._kv_cache_memory_sync = (tensor, work)
+            return False
+
+        _, work = self._kv_cache_memory_sync
+        if not work.is_completed():
+            return False
+        work.wait()
+        self._kv_cache_memory_sync = None
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Synced KV cache memory size to new workers")
+        return True
 
     def _switch_and_prepare(self):
         self._collective_rpc("elastic_ep_execute", args=("switch_and_prepare",))
