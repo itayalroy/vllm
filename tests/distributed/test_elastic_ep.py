@@ -138,6 +138,9 @@ def _run_gsm8k_eval(server: RemoteOpenAIServer, stage: str) -> float:
 def _base_serve_args(
     use_async_eplb: bool = False, data_parallel_size: int = 2
 ) -> list[str]:
+    all2all_backend = os.getenv(
+        "VLLM_TEST_ELASTIC_EP_ALL2ALL_BACKEND", "allgather_reducescatter"
+    )
     args = [
         "--trust-remote-code",
         "--tensor-parallel-size",
@@ -150,7 +153,7 @@ def _base_serve_args(
         str(MAX_NUM_SEQS),
         "--enable-expert-parallel",
         "--all2all-backend",
-        "allgather_reducescatter",
+        all2all_backend,
         "--enable-elastic-ep",
         "--enable-eplb",
         "--eplb-config.num_redundant_experts",
@@ -175,6 +178,41 @@ def _base_serve_args(
         args.append("--enforce-eager")
 
     return args
+
+
+@pytest.mark.parametrize(
+    "use_async_eplb", [False, True], ids=["sync_eplb", "async_eplb"]
+)
+@multi_gpu_test(num_gpus=8)
+def test_elastic_ep_cold_boot_timing(use_async_eplb: bool):
+    dp_size = int(os.getenv("VLLM_TEST_ELASTIC_EP_TARGET_DP", "8"))
+    assert dp_size <= 8
+    if use_async_eplb:
+        from vllm.distributed.eplb.eplb_communicator import has_nixl
+
+        if not has_nixl():
+            pytest.skip("Async EPLB with elastic EP requires NIXL (not installed)")
+
+    vllm_serve_args = _base_serve_args(use_async_eplb, dp_size)
+    mode = "enforce_eager" if "--enforce-eager" in vllm_serve_args else "cuda_graphs"
+
+    start_time = time.perf_counter()
+    with RemoteOpenAIServer(
+        MODEL_NAME, vllm_serve_args, env_dict={}, max_wait_seconds=1200
+    ) as server:
+        ready_seconds = time.perf_counter() - start_time
+        first_completion_start = time.perf_counter()
+        assert _send_liveness_completion(server) == 200
+        first_completion_seconds = time.perf_counter() - first_completion_start
+        total_seconds = time.perf_counter() - start_time
+        print(
+            f"[Elastic EP cold boot timing][{dp_size}]"
+            f"[{mode}]"
+            f"[{'async' if use_async_eplb else 'sync'}_eplb] "
+            f"ready_seconds={ready_seconds:.3f} "
+            f"first_completion_seconds={first_completion_seconds:.3f} "
+            f"total_seconds={total_seconds:.3f}"
+        )
 
 
 @pytest.mark.parametrize(
