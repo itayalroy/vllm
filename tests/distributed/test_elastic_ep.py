@@ -157,7 +157,7 @@ def _base_serve_args(
         "--enable-elastic-ep",
         "--enable-eplb",
         "--eplb-config.num_redundant_experts",
-        "0",
+        os.getenv("VLLM_TEST_ELASTIC_EP_NUM_REDUNDANT_EXPERTS", "0"),
         "--eplb-config.use_async",
         "true" if use_async_eplb else "false",
         "--eplb-config.step_interval",
