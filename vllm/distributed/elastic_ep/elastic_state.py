@@ -11,6 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.elastic_ep.async_utils import SingleMethodAsyncRunner
 from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -92,6 +93,7 @@ class ElasticEPScalingState:
         self._prepare_async_method: str | None = None
         self._prepare_async_last_poll = 0.0
         self._prepare_async_done_keys: list[str] | None = None
+        self._prepare_dp_group_runner = SingleMethodAsyncRunner()
         self._kv_cache_memory_sync: tuple[object, Any] | None = None
         self._standby_groups_created = False
         self.state: EngineState
@@ -368,12 +370,33 @@ class ElasticEPScalingState:
             else self.state == ScaleDownRemainingEngineState.COMPLETE
         )
 
+    def _init_new_dp_group(self, _: str) -> tuple[Any, Any]:
+        return self.new_parallel_config.stateless_init_dp_group(return_store=True)
+
+    def _ensure_new_dp_group(self) -> bool:
+        if self.new_dp_group is not None:
+            return True
+        if not self.prepare_mode:
+            self.new_dp_group, self.new_dp_store = self._init_new_dp_group("")
+            return True
+
+        future = self._prepare_dp_group_runner.start(
+            "init_dp_group", self._init_new_dp_group
+        )
+        if not future.done():
+            return False
+
+        self.new_dp_group, self.new_dp_store = future.result()
+        self._prepare_dp_group_runner.clear("init_dp_group")
+        return True
+
     def _create_standby_groups(self) -> bool:
         assert self.old_dp_group is not None
-        if self._prepare_async_method != "create_standby_groups":
-            self.new_dp_group, self.new_dp_store = (
-                self.new_parallel_config.stateless_init_dp_group(return_store=True)
-            )
+        if (
+            self._prepare_async_method != "create_standby_groups"
+            and not self._ensure_new_dp_group()
+        ):
+            return False
         if not self._elastic_ep_execute("create_standby_groups", self.reconfig_request):
             return False
         self._standby_groups_created = True

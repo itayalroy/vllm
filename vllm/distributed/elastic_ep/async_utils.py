@@ -4,6 +4,7 @@
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future
+from typing import Any
 
 from vllm.logger import init_logger
 
@@ -15,18 +16,21 @@ class SingleMethodAsyncRunner:
         self._lock = threading.Lock()
         self._method: str | None = None
         self._thread: threading.Thread | None = None
-        self._future: Future[None] | None = None
+        self._future: Future[Any] | None = None
 
-    def start(self, method: str, target: Callable[..., None], *args, **kwargs) -> None:
+    def start(
+        self, method: str, target: Callable[..., Any], *args, **kwargs
+    ) -> Future[Any]:
         with self._lock:
             if self._method is not None:
                 if self._method == method:
-                    return
+                    assert self._future is not None
+                    return self._future
                 raise RuntimeError(
                     f"Elastic EP async method is already active: {self._method}"
                 )
 
-            future: Future[None] = Future()
+            future: Future[Any] = Future()
             self._method = method
             self._future = future
             self._thread = threading.Thread(
@@ -36,6 +40,7 @@ class SingleMethodAsyncRunner:
                 name=f"ElasticEPAsync-{method}",
             )
             self._thread.start()
+            return future
 
     def clear(self, method: str) -> None:
         with self._lock:
@@ -56,16 +61,16 @@ class SingleMethodAsyncRunner:
     def _run(
         self,
         method: str,
-        target: Callable[..., None],
-        future: Future[None],
+        target: Callable[..., Any],
+        future: Future[Any],
         args: tuple,
         kwargs: dict,
     ) -> None:
         try:
-            target(method, *args, **kwargs)
+            result = target(method, *args, **kwargs)
         except BaseException as e:
             logger.exception("[Elastic EP] Async worker method %s failed", method)
             future.set_exception(e)
             return
 
-        future.set_result(None)
+        future.set_result(result)
