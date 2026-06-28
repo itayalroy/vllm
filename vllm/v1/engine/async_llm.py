@@ -110,6 +110,7 @@ class AsyncLLM(EngineClient):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
+        self._prepared_elastic_ep_size: int | None = None
 
         tracing_endpoint = self.observability_config.otlp_traces_endpoint
         if tracing_endpoint is not None:
@@ -991,25 +992,19 @@ class AsyncLLM(EngineClient):
             "waiting for requests to drain."
         )
 
-    async def scale_elastic_ep(
-        self, new_data_parallel_size: int, drain_timeout: int = 300
-    ):
+    async def scale_elastic_ep(self, drain_timeout: int = 300) -> None:
         """
-        Scale up or down the data parallel size by adding or removing
-        engine cores.
+        Commit prepared Elastic EP scaling.
+
         Args:
-            new_data_parallel_size: The new number of data parallel workers
             drain_timeout:
                 Maximum time to wait for requests to drain (seconds)
         """
-        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
-        if old_data_parallel_size == new_data_parallel_size:
-            logger.info(
-                "Data parallel size is already %s, skipping scale",
-                new_data_parallel_size,
-            )
-            return
+        new_data_parallel_size = self._prepared_elastic_ep_size
+        if new_data_parallel_size is None:
+            raise ValueError("Call prepare_elastic_ep before scale_elastic_ep")
 
+        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
         if envs.VLLM_ELASTIC_EP_DRAIN_REQUESTS:
             logger.info(
                 "VLLM_ELASTIC_EP_DRAIN_REQUESTS is set, "
@@ -1038,8 +1033,20 @@ class AsyncLLM(EngineClient):
         try:
             await self.engine_core.scale_elastic_ep(new_data_parallel_size)
             self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
+            self._prepared_elastic_ep_size = None
         finally:
             set_scaling_elastic_ep(False)
+
+    async def prepare_elastic_ep(self, new_data_parallel_size: int) -> None:
+        """
+        Prepare Elastic EP scaling without blocking request admission.
+        """
+        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        if old_data_parallel_size == new_data_parallel_size:
+            raise ValueError("new_data_parallel_size must change")
+
+        await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
+        self._prepared_elastic_ep_size = new_data_parallel_size
 
     @property
     def is_running(self) -> bool:

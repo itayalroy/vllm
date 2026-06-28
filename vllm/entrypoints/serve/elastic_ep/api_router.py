@@ -45,19 +45,7 @@ async def scale_elastic_ep(raw_request: Request):
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail="Invalid JSON format") from e
 
-    new_data_parallel_size = body.get("new_data_parallel_size")
     drain_timeout = body.get("drain_timeout", 120)  # Default 2 minutes
-
-    if new_data_parallel_size is None:
-        raise HTTPException(
-            status_code=400, detail="new_data_parallel_size is required"
-        )
-
-    if not isinstance(new_data_parallel_size, int) or new_data_parallel_size <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="new_data_parallel_size must be a positive integer",
-        )
 
     if not isinstance(drain_timeout, int) or drain_timeout <= 0:
         raise HTTPException(
@@ -68,12 +56,10 @@ async def scale_elastic_ep(raw_request: Request):
     set_scaling_elastic_ep(True)
     client = engine_client(raw_request)
     try:
-        await client.scale_elastic_ep(new_data_parallel_size, drain_timeout)
-        return JSONResponse(
-            {
-                "message": f"Scaled to {new_data_parallel_size} data parallel engines",
-            }
-        )
+        await client.scale_elastic_ep(drain_timeout)
+        return JSONResponse({"message": "Committed prepared Elastic EP scaling"})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except TimeoutError as e:
         raise HTTPException(
             status_code=408,
@@ -85,6 +71,33 @@ async def scale_elastic_ep(raw_request: Request):
         raise HTTPException(status_code=500, detail="Scale failed") from e
     finally:
         set_scaling_elastic_ep(False)
+
+
+@router.post("/prepare_elastic_ep", dependencies=[Depends(validate_json_request)])
+async def prepare_elastic_ep(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e
+
+    new_data_parallel_size = body.get("new_data_parallel_size")
+
+    if not isinstance(new_data_parallel_size, int) or new_data_parallel_size <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="new_data_parallel_size must be a positive integer",
+        )
+
+    try:
+        await engine_client(raw_request).prepare_elastic_ep(new_data_parallel_size)
+        return JSONResponse(
+            {"message": f"Prepared scaling to {new_data_parallel_size}"}
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        logger.error("Prepare failed: %s", e)
+        raise HTTPException(status_code=500, detail="Prepare failed") from e
 
 
 @router.post("/is_scaling_elastic_ep")
