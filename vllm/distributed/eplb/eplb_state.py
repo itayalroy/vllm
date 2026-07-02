@@ -631,6 +631,7 @@ class EplbState:
         if self.is_async:
             # Run _move_to_workspace if all ranks have finished transferring the
             # new weights to the intermediate buffer
+            moved_to_workspace = False
             for eplb_model_state in self.model_states.values():
                 # rebalanced must remain consistent amongst all ranks otherwise the
                 # all_reduce in _all_ranks_result_ready will hang
@@ -641,6 +642,14 @@ class EplbState:
                         model_state=eplb_model_state,
                         ep_rank=ep_group.rank(),
                     )
+                    moved_to_workspace = True
+            if moved_to_workspace and not any(
+                state.rebalanced for state in self.model_states.values()
+            ):
+                self.num_valid_physical_experts = max(
+                    state.physical_to_logical_map.shape[1]
+                    for state in self.model_states.values()
+                )
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
