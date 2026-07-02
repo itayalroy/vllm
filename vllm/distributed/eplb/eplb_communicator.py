@@ -82,7 +82,7 @@ class EplbCommunicator(ABC):
         """
 
     def connect(self) -> None:  # noqa: B027
-        """Complete any deferred communicator setup."""
+        """Complete deferred setup and warm peer connections."""
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -258,10 +258,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             all_expert_weights: Expert weight tensors for all MoE layers.
             expert_buffer: Pre-allocated receive buffer tensors.
             defer_remote_setup: If True, postpone the collective
-                all-gather of NIXL agent metadata until the first
-                ``set_transfer_context`` call.  Required for elastic EP
-                where ranks join asynchronously and cannot participate
-                in collectives at construction time.
+                all-gather of NIXL agent metadata until ``connect`` or the
+                first ``set_transfer_context`` call. Required for elastic EP
+                where ranks join asynchronously.
         """
         assert all_expert_weights, (
             "NixlEplbCommunicator requires non-empty all_expert_weights."
@@ -319,6 +318,7 @@ class NixlEplbCommunicator(EplbCommunicator):
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
+        self._connections_warmed = False
         self._init_step("buffers", self._init_registered_buffers)
         if defer_remote_setup:
             logger.info_once("NIXL EPLB: deferring remote agent setup (elastic EP).")
@@ -342,7 +342,25 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._init_remote_state()
 
     def connect(self) -> None:
+        if self._connections_warmed:
+            return
         self._ensure_remote_state()
+        local_buffer = self._expert_buffer[0]
+        assert local_buffer.nbytes >= self._world_size
+        for peer in self._remote_agents:
+            remote_base, _, remote_dev = self._remote_send_meta[peer][(0, 0)]
+            xfer = self._create_peer_xfer(
+                peer,
+                [(local_buffer.data_ptr() + peer, 1, self._cuda_device_id)],
+                [(remote_base, 1, remote_dev)],
+            )
+            self._nixl_wrapper.transfer(xfer[2])
+            self._xfer_entries.append(xfer)
+        try:
+            self._wait_for_all_transfers([x[2] for x in self._xfer_entries])
+        finally:
+            self._release_transfers()
+        self._connections_warmed = True
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -574,6 +592,16 @@ class NixlEplbCommunicator(EplbCommunicator):
         )
         work.wait(timeout=timedelta(minutes=5))
 
+    def _release_transfers(self) -> None:
+        for local_h, remote_h, xfer_h in self._xfer_entries:
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_xfer_handle(xfer_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(local_h)
+            with contextlib.suppress(Exception):
+                self._nixl_wrapper.release_dlist_handle(remote_h)
+        self._xfer_entries.clear()
+
     def execute(self) -> None:
         assert self._layer_idx is not None or not self._xfer_entries, (
             "set_transfer_context() must be called before execute() "
@@ -584,14 +612,7 @@ class NixlEplbCommunicator(EplbCommunicator):
 
             self._post_read_barrier()
         finally:
-            for local_h, remote_h, xfer_h in self._xfer_entries:
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_xfer_handle(xfer_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(local_h)
-                with contextlib.suppress(Exception):
-                    self._nixl_wrapper.release_dlist_handle(remote_h)
-            self._xfer_entries.clear()
+            self._release_transfers()
             self._expert_to_src_row = None
             self._layer_idx = None
 
