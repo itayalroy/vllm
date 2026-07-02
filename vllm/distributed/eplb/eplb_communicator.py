@@ -10,6 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import Any
 
 import numpy as np
 import torch
@@ -254,11 +255,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             cpu_group: CPU process group for metadata exchange.
             all_expert_weights: Expert weight tensors for all MoE layers.
             expert_buffer: Pre-allocated receive buffer tensors.
-            defer_remote_setup: If True, postpone the collective
-                all-gather of NIXL agent metadata until the first
-                ``set_transfer_context`` call.  Required for elastic EP
-                where ranks join asynchronously and cannot participate
-                in collectives at construction time.
+            defer_remote_setup: If True, postpone NIXL initialization until
+                the first ``set_transfer_context`` call. Required for elastic
+                EP where ranks join asynchronously.
         """
         assert all_expert_weights, (
             "NixlEplbCommunicator requires non-empty all_expert_weights."
@@ -304,7 +303,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             if nixl_agent_config is not None
             else None
         )
-        self._nixl_wrapper = nixl_wrapper_cls(self._make_agent_name(), config)
+        self._nixl_wrapper_cls = nixl_wrapper_cls
+        self._nixl_agent_config = config
+        self._nixl_wrapper: Any = None
         self._nixl_memory_type = "VRAM"
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
@@ -316,12 +317,18 @@ class NixlEplbCommunicator(EplbCommunicator):
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
-        self._init_step("buffers", self._init_registered_buffers)
         if defer_remote_setup:
-            logger.info_once("NIXL EPLB: deferring remote agent setup (elastic EP).")
+            logger.info_once("NIXL EPLB: deferring initialization (elastic EP).")
         else:
             self._init_remote_state()
-        self._log_initialized()
+
+    def _init_local_state(self) -> None:
+        if self._nixl_wrapper is not None:
+            return
+        self._nixl_wrapper = self._nixl_wrapper_cls(
+            self._make_agent_name(), self._nixl_agent_config
+        )
+        self._init_step("buffers", self._init_registered_buffers)
 
     def _init_remote_state(self) -> None:
         """Exchange NIXL agent metadata and RDMA pointer info with all peers.
@@ -331,9 +338,11 @@ class NixlEplbCommunicator(EplbCommunicator):
         ``set_transfer_context`` invocation, where all ranks are
         guaranteed to be synchronized.
         """
+        self._init_local_state()
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
         self._remote_state_initialized = True
+        self._log_initialized()
 
     def _ensure_remote_state(self) -> None:
         if not self._remote_state_initialized:
