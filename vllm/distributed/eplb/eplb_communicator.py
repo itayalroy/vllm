@@ -81,6 +81,9 @@ class EplbCommunicator(ABC):
         layer-level context to issue transfers inside add_recv.
         """
 
+    def connect(self) -> None:  # noqa: B027
+        """Complete any deferred communicator setup."""
+
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         """Whether the profile path must run a dummy collective operation to reserve
@@ -327,9 +330,8 @@ class NixlEplbCommunicator(EplbCommunicator):
         """Exchange NIXL agent metadata and RDMA pointer info with all peers.
 
         This is a collective operation (uses ``all_gather_object`` twice).
-        Under elastic EP the call is deferred to the first
-        ``set_transfer_context`` invocation, where all ranks are
-        guaranteed to be synchronized.
+        Under elastic EP the call is deferred until all ranks have created
+        their communicators.
         """
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
@@ -338,6 +340,9 @@ class NixlEplbCommunicator(EplbCommunicator):
     def _ensure_remote_state(self) -> None:
         if not self._remote_state_initialized:
             self._init_remote_state()
+
+    def connect(self) -> None:
+        self._ensure_remote_state()
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:

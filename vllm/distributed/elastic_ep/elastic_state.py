@@ -35,8 +35,9 @@ class ScaleUpExistingEngineState(enum.IntEnum):
     STAGE_QUANT_METHODS = 1
     TRANSFER_WEIGHTS = 2
     SYNC_KV_CACHE_MEMORY_SIZE = 3
-    COMMIT_SCALE_UP = 4
-    COMPLETE = 5
+    CONNECT_EPLB = 4
+    COMMIT_SCALE_UP = 5
+    COMPLETE = 6
 
 
 class ScaleUpNewEngineState(enum.IntEnum):
@@ -185,6 +186,12 @@ class ElasticEPScalingState:
 
         elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:
             if not self._sync_kv_cache_memory_size():
+                return False
+            self.state = ScaleUpExistingEngineState.CONNECT_EPLB
+            return True
+
+        elif state == ScaleUpExistingEngineState.CONNECT_EPLB:
+            if not self._execute_async("connect_eplb_communicator"):
                 return False
             self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
             self._mark_ready_for_switch()

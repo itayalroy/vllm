@@ -218,6 +218,7 @@ class ElasticEPScalingExecutor:
             coord_store_port=reconfig_request.coord_store_port,
             enable_eplb=parallel_config.enable_eplb,
         )
+        self._staged_eplb = self._create_eplb_communicator(get_standby_eplb_group())
         if new_dp_size < old_dp_size:
             self.stage_standby_moe_quant_methods()
 
@@ -323,7 +324,6 @@ class ElasticEPScalingExecutor:
                 )
                 if staged_quant_method is not None:
                     self._staged_moe_quant_methods[module] = staged_quant_method
-        self._staged_eplb = self._create_eplb_communicator(get_standby_eplb_group())
 
     def _create_eplb_communicator(
         self, group: GroupCoordinator | None
@@ -340,6 +340,15 @@ class ElasticEPScalingExecutor:
             expert_buffer=expert_buffer,
         )
         return expert_buffer, communicator
+
+    def connect_eplb_communicator(self) -> None:
+        if self._staged_eplb is not None:
+            self._staged_eplb[1].connect()
+            return
+        eplb_state = self.worker.model_runner.eplb_state
+        assert eplb_state is not None
+        for model_state in eplb_state.model_states.values():
+            model_state.communicator.connect()
 
     def _commit_staged_moe_quant_methods(self) -> None:
         model = self.worker.model_runner.get_model()
@@ -660,6 +669,7 @@ class ElasticEPScalingExecutor:
             assert runner.eplb_state is not None and runner._moe_model is not None
             if not runner.eplb_state.model_states:
                 runner.eplb_state.add_model(runner._moe_model, runner.model_config)
+            self.connect_eplb_communicator()
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
