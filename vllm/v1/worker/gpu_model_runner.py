@@ -3349,6 +3349,7 @@ class GPUModelRunner(
             parallel_config=self.parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
             num_valid_physical_experts=old_num_physical_experts,
+            eplb_state=self.eplb_state,
         )
 
     def _pool(

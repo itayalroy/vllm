@@ -990,15 +990,11 @@ class EplbState:
         parallel_config: ParallelConfig,
         expanded_physical_to_logical: torch.Tensor,
         num_valid_physical_experts: int,
+        eplb_state: "EplbState | None" = None,
     ) -> "EplbState":
-        eplb_state = cls(
-            parallel_config=parallel_config,
-            device=device,
-        )
-        eplb_state.add_model(
-            model=model,
-            model_config=model_config,
-        )
+        eplb_state = eplb_state or cls(parallel_config=parallel_config, device=device)
+        if not eplb_state.model_states:
+            eplb_state.add_model(model=model, model_config=model_config)
         eplb_state.num_valid_physical_experts = num_valid_physical_experts
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
         eplb_model_state.physical_to_logical_map.copy_(expanded_physical_to_logical)

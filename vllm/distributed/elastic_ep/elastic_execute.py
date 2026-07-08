@@ -30,6 +30,7 @@ from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
     get_standby_ep_group,
+    get_standby_eplb_group,
     pop_standby_groups,
 )
 from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
@@ -262,6 +263,9 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
+        standby_eplb_group = get_standby_eplb_group()
+        assert standby_eplb_group is not None
+        self._prepare_eplb_reconfiguration(standby_eplb_group)
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -331,6 +335,15 @@ class ElasticEPScalingExecutor:
             module._replace_quant_method(staged_quant_method)
             staged_quant_method.moe_kernel.prepare_finalize.on_commit()
         self._staged_moe_quant_methods.clear()
+
+    def _prepare_eplb_reconfiguration(self, group: StatelessGroupCoordinator) -> None:
+        runner = self.worker.model_runner
+        eplb_state = runner.eplb_state
+        assert eplb_state is not None and runner._moe_model is not None
+        if not eplb_state.model_states:
+            eplb_state.add_model(runner._moe_model, runner.model_config)
+        eplb_model_state = next(iter(eplb_state.model_states.values()))
+        eplb_model_state.communicator.prepare_reconfiguration(group)
 
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
@@ -473,18 +486,19 @@ class ElasticEPScalingExecutor:
                     module._replace_quant_method(module._quant_method.old_quant_method)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
-        eplb_model_state.expert_buffer = [
-            torch.empty_like(w) for w in model.expert_weights[0]
-        ]
-        assert parallel_config.eplb_config.communicator is not None, (
-            "EPLB communicator backend must be set by ParallelConfig"
-        )
-        eplb_model_state.communicator = create_eplb_communicator(
-            group_coordinator=get_eplb_group(),
-            backend=parallel_config.eplb_config.communicator,
-            expert_weights=model.expert_weights,
-            expert_buffer=eplb_model_state.expert_buffer,
-        )
+        if not eplb_model_state.communicator.commit_reconfiguration(get_eplb_group()):
+            eplb_model_state.expert_buffer = [
+                torch.empty_like(w) for w in model.expert_weights[0]
+            ]
+            assert parallel_config.eplb_config.communicator is not None, (
+                "EPLB communicator backend must be set by ParallelConfig"
+            )
+            eplb_model_state.communicator = create_eplb_communicator(
+                group_coordinator=get_eplb_group(),
+                backend=parallel_config.eplb_config.communicator,
+                expert_weights=model.expert_weights,
+                expert_buffer=eplb_model_state.expert_buffer,
+            )
 
         if (
             self.worker.vllm_config.compilation_config.mode
@@ -541,6 +555,10 @@ class ElasticEPScalingExecutor:
         else:
             mapping, _, num_valid_experts = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
+            eplb_state = self.worker.model_runner.eplb_state
+            assert eplb_state is not None
+            eplb_model_state = next(iter(eplb_state.model_states.values()))
+            eplb_model_state.communicator.commit_reconfiguration(get_eplb_group())
         self._perform_eplb_reshuffle()
         self.warm_and_capture()
 
@@ -606,6 +624,9 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
+        eplb_group = get_eplb_group()
+        assert isinstance(eplb_group, StatelessGroupCoordinator)
+        self._prepare_eplb_reconfiguration(eplb_group)
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()

@@ -81,6 +81,12 @@ class EplbCommunicator(ABC):
         layer-level context to issue transfers inside add_recv.
         """
 
+    def prepare_reconfiguration(self, group: GroupCoordinator) -> None:
+        return None
+
+    def commit_reconfiguration(self, group: GroupCoordinator) -> bool:
+        return False
+
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         """Whether the profile path must run a dummy collective operation to reserve
@@ -313,7 +319,6 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._remote_send_meta: dict[
             int, dict[tuple[int, int], tuple[int, int, int]]
         ] = {}
-
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
         self._init_step("buffers", self._init_registered_buffers)
@@ -338,6 +343,25 @@ class NixlEplbCommunicator(EplbCommunicator):
     def _ensure_remote_state(self) -> None:
         if not self._remote_state_initialized:
             self._init_remote_state()
+
+    def prepare_reconfiguration(self, group: GroupCoordinator) -> None:
+        cpu_group = group.cpu_group
+        assert cpu_group.rank() == self._rank
+        self._init_remote_agents(cpu_group)
+        self._exchange_remote_send_meta(cpu_group)
+
+    def commit_reconfiguration(self, group: GroupCoordinator) -> bool:
+        cpu_group = group.cpu_group
+        assert cpu_group.rank() == self._rank
+        peers = set(range(cpu_group.size())) - {cpu_group.rank()}
+        for peer in self._remote_agents.keys() - peers:
+            self._nixl_wrapper.remove_remote_agent(self._remote_agents.pop(peer))
+            self._remote_send_meta.pop(peer, None)
+        self._cpu_group = cpu_group
+        self._world_size = cpu_group.size()
+        self._rank = cpu_group.rank()
+        self._remote_state_initialized = True
+        return True
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -430,14 +454,22 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._nixl_wrapper.transfer(xfer_h)
         self._xfer_entries.append((local_h, remote_h, xfer_h))
 
-    def _init_remote_agents(self) -> None:
+    def _init_remote_agents(
+        self,
+        cpu_group: ProcessGroup | None = None,
+    ) -> None:
+        cpu_group = cpu_group or self._cpu_group
         local_metadata = self._nixl_wrapper.get_agent_metadata()
-        gathered_metadata: list[bytes | None] = [None] * self._world_size
+        world_size = cpu_group.size()
+        rank = cpu_group.rank()
+        gathered_metadata: list[bytes | None] = [None] * world_size
         torch.distributed.all_gather_object(
-            gathered_metadata, local_metadata, group=self._cpu_group
+            gathered_metadata, local_metadata, group=cpu_group
         )
-        for peer in range(self._world_size):
-            if peer == self._rank:
+        for peer in range(world_size):
+            if peer == rank:
+                continue
+            if peer in self._remote_agents:
                 continue
             peer_metadata = gathered_metadata[peer]
             assert peer_metadata is not None
@@ -455,9 +487,13 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._nixl_wrapper.register_memory(descs)
         self._registered_descs.append(descs)
 
-    def _exchange_remote_send_meta(self) -> None:
+    def _exchange_remote_send_meta(
+        self,
+        cpu_group: ProcessGroup | None = None,
+    ) -> None:
         """Exchange per-layer per-tensor metadata so receivers can compute
         remote RDMA addresses at transfer time."""
+        cpu_group = cpu_group or self._cpu_group
         local_meta: dict[tuple[int, int], tuple[int, int, int]] = {}
         for layer_idx, layer_tensors in enumerate(self._all_expert_weights):
             for t_idx, t in enumerate(layer_tensors):
@@ -473,13 +509,13 @@ class NixlEplbCommunicator(EplbCommunicator):
         # the remote RDMA address for each expert.
         gathered_meta: list[dict[tuple[int, int], tuple[int, int, int]] | None] = [
             None
-        ] * self._world_size
-        torch.distributed.all_gather_object(
-            gathered_meta, local_meta, group=self._cpu_group
-        )
+        ] * cpu_group.size()
+        torch.distributed.all_gather_object(gathered_meta, local_meta, group=cpu_group)
 
         local_keys = set(local_meta.keys())
-        for peer in self._remote_agents:
+        for peer in range(cpu_group.size()):
+            if peer == cpu_group.rank():
+                continue
             peer_meta = gathered_meta[peer]
             assert peer_meta is not None
             peer_keys = set(peer_meta.keys())
