@@ -1370,24 +1370,21 @@ def _replace_active_groups(
     ep: GroupCoordinator | None,
     eplb: GroupCoordinator | None,
     node_count: int | None,
-) -> None:
-    """Destroy the current DP/EP/WORLD/EPLB groups and replace them.
+) -> tuple[GroupCoordinator | None, ...]:
+    """Replace the active groups and return the groups they replaced.
 
-    Destruction is collective — all ranks in the old groups must call this
-    function together.  Pass all-``None`` to tear down without replacement.
+    The caller must destroy the returned DP, EP, WORLD, and EPLB groups
+    collectively and in that order. Pass all-``None`` to remove the active
+    groups without replacement.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
-    from vllm.distributed.elastic_ep.timing import record_commit_stage
-
-    for name, group in (("dp", _DP), ("ep", _EP), ("world", _WORLD), ("eplb", _EPLB)):
-        if group is not None:
-            with record_commit_stage(f"switch.destroy_old_groups.{name}"):
-                group.destroy()
+    old_groups = _DP, _EP, _WORLD, _EPLB
     _WORLD = world
     _DP = dp
     _EP = ep
     _EPLB = eplb
     _NODE_COUNT = node_count
+    return old_groups
 
 
 _TP: GroupCoordinator | None = None
