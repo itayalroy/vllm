@@ -11,6 +11,10 @@ from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.elastic_ep.timing import (
+    collect_commit_timing,
+    record_commit_stage,
+)
 from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -194,11 +198,22 @@ class ElasticEPScalingState:
         elif state == ScaleUpExistingEngineState.COMMIT_SCALE_UP:
             if not self.commit_requested:
                 return False
-            self._commit_new_dp_group()
-            self._collective_rpc("elastic_ep_execute", args=("commit_scale_up", True))
-            self.state = ScaleUpExistingEngineState.COMPLETE
-            self._update_parallel_config()
-            self._send_reconfigure_finished()
+            with collect_commit_timing(
+                "engine_core",
+                "scale_up",
+                dp_rank=self.engine_core.dp_rank,
+                worker_type=self.worker_type,
+            ):
+                self._commit_new_dp_group()
+                with record_commit_stage("worker_collective_commit"):
+                    self._collective_rpc(
+                        "elastic_ep_execute", args=("commit_scale_up", True)
+                    )
+                self.state = ScaleUpExistingEngineState.COMPLETE
+                with record_commit_stage("update_parallel_config"):
+                    self._update_parallel_config()
+                with record_commit_stage("send_finished_notification"):
+                    self._send_reconfigure_finished()
             return True
 
         else:
@@ -230,8 +245,17 @@ class ElasticEPScalingState:
             self.engine_core.engines_running = bool(data[0])
             self.engine_core.current_wave = int(data[1])
             self.engine_core.step_counter = int(data[2])
-            self._collective_rpc("elastic_ep_execute", args=("commit_scale_up", False))
-            self.state = ScaleUpNewEngineState.COMPLETE
+            with collect_commit_timing(
+                "engine_core",
+                "scale_up",
+                dp_rank=self.engine_core.dp_rank,
+                worker_type=self.worker_type,
+            ):
+                with record_commit_stage("worker_collective_commit"):
+                    self._collective_rpc(
+                        "elastic_ep_execute", args=("commit_scale_up", False)
+                    )
+                self.state = ScaleUpNewEngineState.COMPLETE
             return True
 
         else:
@@ -252,11 +276,20 @@ class ElasticEPScalingState:
         elif state == ScaleDownRemainingEngineState.COMMIT_SCALE_DOWN:
             if not self.commit_requested:
                 return False
-            self._commit_scale_down(removing=False)
-            self._commit_new_dp_group()
-            self._update_parallel_config()
-            self.state = ScaleDownRemainingEngineState.COMPLETE
-            self._send_reconfigure_finished()
+            with collect_commit_timing(
+                "engine_core",
+                "scale_down",
+                dp_rank=self.engine_core.dp_rank,
+                worker_type=self.worker_type,
+            ):
+                with record_commit_stage("worker_collective_commit"):
+                    self._commit_scale_down(removing=False)
+                self._commit_new_dp_group()
+                with record_commit_stage("update_parallel_config"):
+                    self._update_parallel_config()
+                self.state = ScaleDownRemainingEngineState.COMPLETE
+                with record_commit_stage("send_finished_notification"):
+                    self._send_reconfigure_finished()
             return True
 
         else:
@@ -269,11 +302,19 @@ class ElasticEPScalingState:
 
         if state == ScaleDownRemovingEngineState.PREPARE:
             assert self.old_dp_group.rank() > 0
-            self._commit_scale_down(removing=True)
-            self.state = ScaleDownRemovingEngineState.COMPLETE
-            self.engine_core._eep_send_engine_core_notification(
-                EEPNotificationType.SHUTDOWN_COMPLETE
-            )
+            with collect_commit_timing(
+                "engine_core",
+                "scale_down",
+                dp_rank=self.engine_core.dp_rank,
+                worker_type=self.worker_type,
+            ):
+                with record_commit_stage("worker_collective_commit"):
+                    self._commit_scale_down(removing=True)
+                self.state = ScaleDownRemovingEngineState.COMPLETE
+                with record_commit_stage("send_shutdown_notification"):
+                    self.engine_core._eep_send_engine_core_notification(
+                        EEPNotificationType.SHUTDOWN_COMPLETE
+                    )
             return True
 
         else:
@@ -378,28 +419,31 @@ class ElasticEPScalingState:
         return True
 
     def _commit_new_dp_group(self):
-        old_dp_group = self.old_dp_group
-        stateless_destroy_torch_distributed_process_group(old_dp_group)
-        assert self.new_dp_group is not None
-        new_dp_group = self.new_dp_group
-        self.engine_core.dp_group = new_dp_group
-        self.engine_core.dp_rank = new_dp_group.rank()
-        self.engine_core.dp_store = self.new_dp_store
-        engines_running = int(self.engine_core.engines_running)
-        current_wave = self.engine_core.current_wave
-        step_counter = self.engine_core.step_counter
-        tensor = torch.tensor(
-            [engines_running, current_wave, step_counter],
-            dtype=torch.int32,
-            device="cpu",
-        )
-        torch.distributed.all_reduce(
-            tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
-        )
-        data = tensor.tolist()
-        self.engine_core.engines_running = bool(data[0])
-        self.engine_core.current_wave = int(data[1])
-        self.engine_core.step_counter = int(data[2])
+        with record_commit_stage("dp_group.destroy_old"):
+            old_dp_group = self.old_dp_group
+            stateless_destroy_torch_distributed_process_group(old_dp_group)
+        with record_commit_stage("dp_group.install_new"):
+            assert self.new_dp_group is not None
+            new_dp_group = self.new_dp_group
+            self.engine_core.dp_group = new_dp_group
+            self.engine_core.dp_rank = new_dp_group.rank()
+            self.engine_core.dp_store = self.new_dp_store
+            engines_running = int(self.engine_core.engines_running)
+            current_wave = self.engine_core.current_wave
+            step_counter = self.engine_core.step_counter
+            tensor = torch.tensor(
+                [engines_running, current_wave, step_counter],
+                dtype=torch.int32,
+                device="cpu",
+            )
+        with record_commit_stage("dp_group.sync_engine_state"):
+            torch.distributed.all_reduce(
+                tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
+            )
+            data = tensor.tolist()
+            self.engine_core.engines_running = bool(data[0])
+            self.engine_core.current_wave = int(data[1])
+            self.engine_core.step_counter = int(data[2])
         if new_dp_group.rank() == 0:
             logger.info("[Elastic EP] Switched to new setup")
 

@@ -6,6 +6,7 @@ import time
 from collections.abc import Generator
 
 from vllm.config import CompilationMode, VllmConfig
+from vllm.distributed.elastic_ep.timing import record_commit_metric
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -19,6 +20,7 @@ def monitor_torch_compile(
     vllm_config: VllmConfig,
     message: str = "torch.compile took %.2f s in total",
     is_encoder: bool = False,
+    timing_metric: str = "torch_compile_seconds",
 ) -> Generator[None, None, None]:
     """Context manager that times torch.compile and manages depyf debugging.
 
@@ -51,6 +53,7 @@ def monitor_torch_compile(
             else:
                 compilation_config.compilation_time += total_compile_time
             logger.info_once(message, total_compile_time)
+            record_commit_metric(timing_metric, total_compile_time)
     finally:
         if depyf_cm is not None:
             try:
@@ -82,6 +85,7 @@ def monitor_profiling_run() -> Generator[None, None, None]:
         "Initial profiling/warmup run took %.2f s",
         elapsed,
     )
+    record_commit_metric("initial_profile_warmup_seconds", elapsed)
 
 
 cudagraph_capturing_enabled: bool = True
