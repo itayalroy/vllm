@@ -37,6 +37,7 @@ from vllm.distributed.elastic_ep.timing import (
 )
 from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
     _replace_active_groups,
     get_eplb_group,
     prepare_communication_buffer_for_model,
@@ -153,6 +154,7 @@ class ElasticEPScalingExecutor:
             max_workers=1, thread_name_prefix="ElasticEPAsync"
         )
         self._async_future: Future[None] | None = None
+        self._group_cleanup_future: Future[None] | None = None
 
     @property
     def worker(self):
@@ -183,6 +185,7 @@ class ElasticEPScalingExecutor:
     def _run_async(self, execute_method: str, *args, **kwargs) -> None:
         from vllm.platforms import current_platform
 
+        self._wait_for_group_cleanup()
         self.worker.vllm_config.enable_trace_function_call_for_thread()
         assert hasattr(self.worker, "device")
         current_platform.set_device(self.worker.device)
@@ -206,6 +209,38 @@ class ElasticEPScalingExecutor:
             raise RuntimeError("Elastic EP async method is not done")
         self._async_future = None
         future.result()
+
+    def _destroy_retired_groups(
+        self, groups: tuple[GroupCoordinator | None, ...]
+    ) -> None:
+        from vllm.platforms import current_platform
+
+        current_platform.set_device(self.worker.device)
+        with collect_commit_timing(
+            "worker",
+            "group_cleanup",
+            worker_rank=self.worker.rank,
+            dp_rank=self.worker.vllm_config.parallel_config.data_parallel_rank,
+        ):
+            for name, group in zip(("dp", "ep", "world", "eplb"), groups):
+                if group is not None:
+                    with record_commit_stage(f"switch.destroy_old_groups.{name}"):
+                        group.destroy()
+
+    def _start_group_cleanup(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
+        self._wait_for_group_cleanup()
+        self._group_cleanup_future = self._async_executor.submit(
+            self._destroy_retired_groups, groups
+        )
+
+    def _wait_for_group_cleanup(self) -> None:
+        if (future := self._group_cleanup_future) is not None:
+            future.result()
+            self._group_cleanup_future = None
+
+    def shutdown(self) -> None:
+        self._wait_for_group_cleanup()
+        self._async_executor.shutdown()
 
     def load_model(self) -> None:
         self.worker.load_model(load_dummy_weights=True)
@@ -373,14 +408,19 @@ class ElasticEPScalingExecutor:
 
     def switch_and_remove(self) -> None:
         self._release_cuda_graphs("switch.release_cuda_graphs")
-        _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        old_groups = _replace_active_groups(
+            world=None, dp=None, ep=None, eplb=None, node_count=None
+        )
+        self._start_group_cleanup(old_groups)
+        # Finish collective cleanup before this worker is shut down.
+        self._wait_for_group_cleanup()
 
-    def switch_and_prepare(self) -> None:
+    def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs("switch.release_cuda_graphs")
-        _replace_active_groups(**pop_standby_groups())
+        old_groups = _replace_active_groups(**pop_standby_groups())
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -544,6 +584,7 @@ class ElasticEPScalingExecutor:
                 )
                 compilation_counter.stock_torch_compile_count += 1
                 self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
+        return old_groups
 
     def _perform_eplb_reshuffle(
         self,
@@ -592,7 +633,7 @@ class ElasticEPScalingExecutor:
         ):
             if switch:
                 self.broadcast_expert_mapping()
-                self.switch_and_prepare()
+                old_groups = self.switch_and_prepare()
             else:
                 with record_commit_stage(
                     "expert_mapping.receive", synchronize_gpu=True
@@ -614,6 +655,8 @@ class ElasticEPScalingExecutor:
                 with record_commit_stage("eplb.reshuffle", synchronize_gpu=True):
                     self._perform_eplb_reshuffle()
                 self.warm_and_capture()
+            if switch:
+                self._start_group_cleanup(old_groups)
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         with collect_commit_timing(
@@ -627,8 +670,9 @@ class ElasticEPScalingExecutor:
             if removing:
                 self.switch_and_remove()
             else:
-                self.switch_and_prepare()
+                old_groups = self.switch_and_prepare()
                 self.warm_and_capture()
+                self._start_group_cleanup(old_groups)
 
     def perform_scale_down_eplb_reshuffle(self, new_dp_size: int) -> None:
         eplb_state = self.worker.model_runner.eplb_state
