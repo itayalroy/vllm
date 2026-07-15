@@ -275,6 +275,7 @@ class ElasticEPScalingExecutor:
             enable_eplb=parallel_config.enable_eplb,
         )
         if new_dp_size < old_dp_size:
+            self._warm_target_groups()
             self.stage_standby_moe_quant_methods()
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
@@ -322,6 +323,17 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
+        self._warm_target_groups()
+
+    def _warm_target_groups(self) -> None:
+        dp_group = get_standby_dp_group() or get_dp_group()
+        ep_group = get_standby_ep_group() or get_ep_group()
+        stream = torch.Stream(device=dp_group.device)
+        with stream:
+            tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
+            for group in (dp_group, ep_group):
+                torch.distributed.all_reduce(tensor, group=group.device_group)
+        stream.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -741,6 +753,7 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
+        self._warm_target_groups()
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
