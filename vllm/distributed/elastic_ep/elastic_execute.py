@@ -33,6 +33,7 @@ from vllm.distributed.elastic_ep.standby_state import (
 )
 from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
     _replace_active_groups,
     get_eplb_group,
     prepare_communication_buffer_for_model,
@@ -154,6 +155,7 @@ class ElasticEPScalingExecutor:
             max_workers=1, thread_name_prefix="ElasticEPAsync"
         )
         self._async_future: Future[None] | None = None
+        self._group_cleanup_future: Future[None] | None = None
 
     @property
     def worker(self):
@@ -208,12 +210,40 @@ class ElasticEPScalingExecutor:
         self._async_future = None
         future.result()
 
+    def _destroy_retired_groups(
+        self, groups: tuple[GroupCoordinator | None, ...]
+    ) -> None:
+        from vllm.platforms import current_platform
+
+        current_platform.set_device(self.worker.device)
+        for group in groups:
+            if group is not None:
+                group.destroy()
+
+    def _start_group_cleanup(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
+        assert self._group_cleanup_future is None
+        self._group_cleanup_future = self._async_executor.submit(
+            self._destroy_retired_groups, groups
+        )
+
+    def _wait_for_group_cleanup(self) -> None:
+        if (future := self._group_cleanup_future) is not None:
+            future.result()
+            self._group_cleanup_future = None
+
+    def shutdown(self) -> None:
+        try:
+            self._wait_for_group_cleanup()
+        finally:
+            self._async_executor.shutdown()
+
     def load_model(self) -> None:
         self.worker.load_model(load_dummy_weights=True)
 
     def create_standby_groups(
         self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
     ) -> None:
+        self._wait_for_group_cleanup()
         self.reconfig_request = reconfig_request
         new_dp_size = reconfig_request.new_data_parallel_size
         old_dp_size = get_dp_group().world_size
@@ -363,15 +393,22 @@ class ElasticEPScalingExecutor:
         torch.accelerator.empty_cache()
 
     def switch_and_remove(self) -> None:
+        self._wait_for_group_cleanup()
         self._release_cuda_graphs()
-        _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
+        retired_groups = _replace_active_groups(
+            world=None, dp=None, ep=None, eplb=None, node_count=None
+        )
+        self._start_group_cleanup(retired_groups)
+        # Finish collective cleanup before this worker is shut down.
+        self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> None:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs()
-        _replace_active_groups(**pop_standby_groups())
+        retired_groups = _replace_active_groups(**pop_standby_groups())
+        self._start_group_cleanup(retired_groups)
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
