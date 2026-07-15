@@ -306,6 +306,17 @@ class ElasticEPScalingExecutor:
             )
         torch.accelerator.synchronize()
 
+    def warm_target_groups(self, standby: bool = False) -> None:
+        dp_group = get_standby_dp_group() if standby else get_dp_group()
+        ep_group = get_standby_ep_group() if standby else get_ep_group()
+        assert dp_group is not None and ep_group is not None
+        stream = torch.Stream(device=dp_group.device)
+        with stream:
+            tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
+            for group in (dp_group, ep_group):
+                torch.distributed.all_reduce(tensor, group=group.device_group)
+        stream.synchronize()
+
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
