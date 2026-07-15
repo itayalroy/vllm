@@ -29,6 +29,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import suppress
 from typing import Any, Literal, cast
 
+from vllm.distributed.elastic_ep.timing import increment_commit_counter
 from vllm.logger import init_logger
 from vllm.triton_utils.importing import HAS_TRITON
 
@@ -117,6 +118,8 @@ def _handle_jit_event(
     fn_name: str,
     detail: str | None = None,
 ) -> None:
+    event_key = f"jit_events_{backend}_{event}".lower().replace(" ", "_")
+    increment_commit_counter(event_key)
     message = (
         "%s %s during inference: %s%s. "
         "This causes a latency spike; consider extending warmup "
