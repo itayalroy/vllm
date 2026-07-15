@@ -29,6 +29,7 @@ from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
 )
+from vllm.distributed.elastic_ep.timing import record_commit_stage
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -702,10 +703,12 @@ class Worker(WorkerBase):
                     warmup_sizes.append(compile_range.end)
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for size in sorted(warmup_sizes, reverse=True):
-            logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
-        self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        with record_commit_stage("warmup.compile_sizes", synchronize_gpu=True):
+            for size in sorted(warmup_sizes, reverse=True):
+                logger.info("Compile and warming up model for size %d", size)
+                self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        with record_commit_stage("warmup.remove_loras", synchronize_gpu=True):
+            self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
@@ -789,30 +792,32 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if self.use_v2_model_runner:
-            # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
-            warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
-        elif get_pp_group().is_last_rank:
-            # V1: Warm up sampler and preallocate memory buffer for logits and other
-            # sampling related tensors of max possible shape to avoid memory
-            # fragmentation issue.
-            # NOTE: This is called after `capture_model` on purpose to prevent
-            # memory buffers from being cleared by `torch.accelerator.empty_cache`.
-            max_num_reqs = min(
-                self.scheduler_config.max_num_seqs,
-                self.scheduler_config.max_num_batched_tokens,
-            )
+        with record_commit_stage("warmup.post_capture_kernels", synchronize_gpu=True):
+            if self.use_v2_model_runner:
+                # V2: Run full execute_model + sample_tokens to JIT compile kernels.
+                warmup_kernels(
+                    self.model_runner, self.execute_model, self.sample_tokens
+                )
+            elif get_pp_group().is_last_rank:
+                # V1: Warm up sampler and preallocate memory buffer for logits and
+                # other sampling related tensors of max possible shape.
+                max_num_reqs = min(
+                    self.scheduler_config.max_num_seqs,
+                    self.scheduler_config.max_num_batched_tokens,
+                )
 
-            # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            )
-            if self.model_runner.is_pooling_model:
-                self.model_runner._dummy_pooler_run(hidden_states)
-            else:
-                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+                # We skip EPLB here since we don't want to record dummy metrics
+                hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs,
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
+                if self.model_runner.is_pooling_model:
+                    self.model_runner._dummy_pooler_run(hidden_states)
+                else:
+                    self.model_runner._dummy_sampler_run(
+                        hidden_states=last_hidden_states
+                    )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

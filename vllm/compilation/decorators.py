@@ -291,7 +291,12 @@ def _try_load_aot_compiled_fn(
     Re-raises on failure when ``VLLM_FORCE_AOT_LOAD`` is set.
     """
     try:
-        with monitor_torch_compile(model.vllm_config, is_encoder=model._is_encoder):
+        with monitor_torch_compile(
+            model.vllm_config,
+            "AOT cache load took %.2f s in total",
+            is_encoder=model._is_encoder,
+            timing_metric="aot_cache_load_seconds",
+        ):
             with (
                 set_current_vllm_config(model.vllm_config),
                 open(aot_compilation_path, "rb") as f,
@@ -658,7 +663,10 @@ def _support_torch_compile(
                 self._aot_compilation_path = aot_compilation_path
                 self._aot_cache_dir = cache_dir
                 with monitor_torch_compile(
-                    self.vllm_config, is_encoder=self._is_encoder
+                    self.vllm_config,
+                    "AOT compile and save took %.2f s in total",
+                    is_encoder=self._is_encoder,
+                    timing_metric="aot_compile_and_save_seconds",
                 ):
                     self.aot_compiled_fn = self.aot_compile(*args, **kwargs)
                     compilation_counter.num_aot_compiles += 1
@@ -674,6 +682,7 @@ def _support_torch_compile(
                     "torch.compile and initial profiling/warmup "
                     "run together took %.2f s in total",
                     is_encoder=self._is_encoder,
+                    timing_metric="torch_compile_and_profile_seconds",
                 ):
                     output = TorchCompileWithNoGuardsWrapper.__call__(
                         self,  # type: ignore[arg-type]

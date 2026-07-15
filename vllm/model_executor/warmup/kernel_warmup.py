@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm.distributed.elastic_ep.timing import record_commit_stage
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
@@ -100,42 +101,56 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
-        warm_v1_block_table_kernels(
-            getattr(worker.model_runner, "device", torch.device("cuda")),
-            worker.scheduler_config.max_num_batched_tokens,
-        )
-    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+        with record_commit_stage("kernel_warmup.v1_block_table", synchronize_gpu=True):
+            warm_v1_block_table_kernels(
+                getattr(worker.model_runner, "device", torch.device("cuda")),
+                worker.scheduler_config.max_num_batched_tokens,
+            )
+    with record_commit_stage("kernel_warmup.qwen_triton", synchronize_gpu=True):
+        qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
-    deepseek_v4_mhc_warmup(
-        worker.get_model(),
-        max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
-    )
+    with record_commit_stage("kernel_warmup.deepseek_v4_mhc", synchronize_gpu=True):
+        deepseek_v4_mhc_warmup(
+            worker.get_model(),
+            max_tokens=worker.scheduler_config.max_num_batched_tokens,
+            cudagraph_capture_sizes=(
+                worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+            ),
+        )
 
     # Run next so input-prep kernels JIT against pristine runner state.
     if worker.vllm_config.kernel_config.enable_jit_warmup:
-        fa4_cutedsl_warmup(worker)
-        sparse_mla_triton_warmup(worker)
+        with record_commit_stage("kernel_warmup.fa4_cutedsl", synchronize_gpu=True):
+            fa4_cutedsl_warmup(worker)
+        with record_commit_stage(
+            "kernel_warmup.sparse_mla_triton", synchronize_gpu=True
+        ):
+            sparse_mla_triton_warmup(worker)
 
     if current_platform.has_device_capability(90):
         _warmup_ll_bf16_router_gemm(worker.get_model())
 
     if worker.vllm_config.kernel_config.enable_cutedsl_warmup:
-        # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
-        # to the shared JIT warmup infrastructure.
-        # https://github.com/vllm-project/vllm/pull/47451
-        cutedsl_warmup()
+        with record_commit_stage("kernel_warmup.cutedsl", synchronize_gpu=True):
+            # TODO(roberto): Remove after registered CuTeDSL warmups are migrated
+            # to the shared JIT warmup infrastructure.
+            # https://github.com/vllm-project/vllm/pull/47451
+            cutedsl_warmup()
 
     if process_local_only:
         return
 
-    flashinfer_sparse_mla_decode_autotune_warmup(worker)
-    deepseek_v4_sparse_mla_attention_warmup(worker)
+    with record_commit_stage(
+        "kernel_warmup.flashinfer_sparse_mla", synchronize_gpu=True
+    ):
+        flashinfer_sparse_mla_decode_autotune_warmup(worker)
+    with record_commit_stage(
+        "kernel_warmup.deepseek_v4_sparse_mla", synchronize_gpu=True
+    ):
+        deepseek_v4_sparse_mla_attention_warmup(worker)
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
@@ -146,9 +161,11 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if do_deep_gemm_warmup:
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
-        deep_gemm_warmup(model, max_tokens)
+        with record_commit_stage("kernel_warmup.deep_gemm", synchronize_gpu=True):
+            deep_gemm_warmup(model, max_tokens)
 
-    minimax_m3_msa_warmup(worker)
+    with record_commit_stage("kernel_warmup.minimax_m3_msa", synchronize_gpu=True):
+        minimax_m3_msa_warmup(worker)
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
@@ -157,7 +174,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
-        flashinfer_autotune(worker.model_runner)
+        with record_commit_stage(
+            "kernel_warmup.flashinfer_autotune", synchronize_gpu=True
+        ):
+            flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -183,13 +203,16 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         logger.info("Warming up FlashInfer attention.")
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
-        worker.model_runner._dummy_run(
-            num_tokens=16,
-            skip_eplb=True,
-            is_profile=True,
-            force_attention=True,
-            create_mixed_batch=True,
-        )
+        with record_commit_stage(
+            "kernel_warmup.flashinfer_attention", synchronize_gpu=True
+        ):
+            worker.model_runner._dummy_run(
+                num_tokens=16,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=True,
+            )
 
 
 def _flashinfer_autotune_skip_ops(runner: "GPUModelRunner") -> set[str] | None:
