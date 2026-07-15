@@ -174,7 +174,7 @@ def _base_serve_args(dp_size: int = 2, enforce_eager: bool = False) -> list[str]
         str(MAX_NUM_SEQS),
         "--enable-expert-parallel",
         "--all2all-backend",
-        "allgather_reducescatter",
+        os.getenv("VLLM_TEST_ELASTIC_EP_ALL2ALL_BACKEND", "allgather_reducescatter"),
         "--enable-elastic-ep",
         "--enable-eplb",
         "--eplb-config.num_redundant_experts",
