@@ -38,6 +38,10 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+from vllm.distributed.elastic_ep.timing import (
+    increment_commit_counter,
+    record_commit_stage,
+)
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -6751,7 +6755,8 @@ class GPUModelRunner(
             return 0
 
         # Initialize encoder CUDA graph manager if enabled.
-        self._maybe_init_encoder_cudagraph_manager()
+        with record_commit_stage("cudagraph.initialize"):
+            self._maybe_init_encoder_cudagraph_manager()
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
@@ -6800,9 +6805,10 @@ class GPUModelRunner(
             )
 
         with self._freeze_gc(), graph_capture(device=self.device):
-            torch.accelerator.synchronize()
-            torch.accelerator.empty_cache()
-            start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            with record_commit_stage("cudagraph.setup"):
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
             for (
                 runtime_mode,
@@ -6813,15 +6819,23 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=runtime_mode,
                     profiler=profiler,
                 )
-                torch.accelerator.synchronize()
+                mode = runtime_mode.name.lower()
+                with record_commit_stage(f"cudagraph.{mode}.mode_sync"):
+                    torch.accelerator.synchronize()
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
-                encoder_graph_pool = current_platform.graph_pool_handle()
-                self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)
+                with record_commit_stage(
+                    "cudagraph.encoder_capture", synchronize_gpu=True
+                ):
+                    encoder_graph_pool = current_platform.graph_pool_handle()
+                    self.encoder_cudagraph_manager.capture(
+                        graph_pool=encoder_graph_pool
+                    )
 
-            torch.accelerator.synchronize()
-            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            with record_commit_stage("cudagraph.final_sync"):
+                torch.accelerator.synchronize()
+                end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -6830,12 +6844,13 @@ class GPUModelRunner(
         # after here.
         set_cudagraph_capturing_enabled(False)
 
-        torch.accelerator.synchronize()
-        torch.accelerator.empty_cache()
+        with record_commit_stage("cudagraph.cleanup"):
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
 
-        # Lock workspace to prevent resizing during execution.
-        # Max workspace sizes should have been captured during warmup/profiling.
-        lock_workspace()
+            # Lock workspace to prevent resizing during execution.
+            # Max workspace sizes should have been captured during warmup/profiling.
+            lock_workspace()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -6862,19 +6877,26 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        mode = cudagraph_runtime_mode.name.lower()
         for _ in range(num_warmups):
-            self._dummy_run(
-                desc.num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                force_attention=force_attention,
-                uniform_decode=desc.uniform,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=True,
-                remove_lora=False,
-                num_active_loras=desc.num_active_loras,
-                profile_seq_lens=profile_seq_lens,
-            )
+            with record_commit_stage(
+                f"cudagraph.{mode}.shape_warmup", synchronize_gpu=True
+            ):
+                self._dummy_run(
+                    desc.num_tokens,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    force_attention=force_attention,
+                    uniform_decode=desc.uniform,
+                    allow_microbatching=allow_microbatching,
+                    skip_eplb=True,
+                    remove_lora=False,
+                    num_active_loras=desc.num_active_loras,
+                    profile_seq_lens=profile_seq_lens,
+                )
+            increment_commit_counter(f"cudagraph_{mode}_warmup_runs")
+        captured_before = compilation_counter.num_cudagraph_captured
         with (
+            record_commit_stage(f"cudagraph.{mode}.capture", synchronize_gpu=True),
             profiler,
             torch.profiler.record_function(
                 f"capture_{desc.num_tokens}_{cudagraph_runtime_mode.name}"
@@ -6891,6 +6913,11 @@ class GPUModelRunner(
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
             )
+        increment_commit_counter(f"cudagraph_{mode}_capture_runs")
+        increment_commit_counter(
+            f"cudagraph_{mode}_graphs_captured",
+            compilation_counter.num_cudagraph_captured - captured_before,
+        )
 
     def _capture_cudagraphs(
         self,
@@ -6941,8 +6968,11 @@ class GPUModelRunner(
                 allow_microbatching=allow_microbatching,
                 profiler=profiler,
             )
-            torch.accelerator.synchronize()
-        self.maybe_remove_all_loras(self.lora_config)
+            mode = cudagraph_runtime_mode.name.lower()
+            with record_commit_stage(f"cudagraph.{mode}.descriptor_sync"):
+                torch.accelerator.synchronize()
+        with record_commit_stage("cudagraph.remove_loras", synchronize_gpu=True):
+            self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(
         self,

@@ -22,6 +22,10 @@ import zmq.asyncio
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed.elastic_ep.timing import (
+    collect_commit_timing,
+    record_commit_stage,
+)
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -1683,48 +1687,63 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info("[Elastic EP] Successfully started new engines")
 
     async def _commit_scale_up_elastic_ep(self, new_data_parallel_size: int) -> None:
-        new_core_engines = [
-            rank.to_bytes(2, "little")
-            for rank in range(len(self.core_engines), new_data_parallel_size)
-        ]
+        old_data_parallel_size = len(self.core_engines)
+        with collect_commit_timing(
+            "core_client",
+            "scale_up",
+            old_dp_size=old_data_parallel_size,
+            new_dp_size=new_data_parallel_size,
+        ):
+            new_core_engines = [
+                rank.to_bytes(2, "little")
+                for rank in range(old_data_parallel_size, new_data_parallel_size)
+            ]
 
-        await self.pause_scheduler_async(mode="keep", clear_cache=False)
-        wait_future = self._eep_wait_for_setup_switch_complete()
-        finish_futures = [
-            asyncio.create_task(
-                self._call_utility_async("commit_prepared_elastic_ep", engine=engine)
+            with record_commit_stage("pause_schedulers"):
+                await self.pause_scheduler_async(mode="keep", clear_cache=False)
+            wait_future = self._eep_wait_for_setup_switch_complete()
+            finish_futures = [
+                asyncio.create_task(
+                    self._call_utility_async(
+                        "commit_prepared_elastic_ep", engine=engine
+                    )
+                )
+                for engine in self.core_engines
+            ]
+            try:
+                with record_commit_stage("send_commit_requests"):
+                    await asyncio.gather(*finish_futures)
+                with record_commit_stage("wait_for_reconfiguration_finished"):
+                    await wait_future
+                with record_commit_stage("wait_for_new_engines_ready"):
+                    self._wait_for_new_engine_ready(new_core_engines)
+            except Exception:
+                wait_future.cancel()
+                raise
+
+            with record_commit_stage("publish_new_engines"):
+                self.core_engines.extend(new_core_engines)
+                # Update the parallel config
+                parallel_config = self.vllm_config.parallel_config
+                parallel_config.data_parallel_size = new_data_parallel_size
+                if isinstance(self.resources.engine_manager, CoreEngineActorManager):
+                    parallel_config.data_parallel_size_local = len(
+                        self.resources.engine_manager.local_engine_actors
+                    )
+                # Notify coordinator about scale up through existing
+                # stats_update_task connection
+                self._ensure_stats_update_task()
+                scale_up_marker = msgspec.msgpack.encode(
+                    ("SCALE_ELASTIC_EP", new_data_parallel_size)
+                )
+                await self.first_req_send_socket.send(scale_up_marker)
+
+            logger.info(
+                "[Elastic EP] Scale up completed, new data parallel size: %s",
+                new_data_parallel_size,
             )
-            for engine in self.core_engines
-        ]
-        try:
-            await asyncio.gather(*finish_futures)
-            await wait_future
-            self._wait_for_new_engine_ready(new_core_engines)
-        except Exception:
-            wait_future.cancel()
-            raise
-
-        self.core_engines.extend(new_core_engines)
-        # Update the parallel config
-        parallel_config = self.vllm_config.parallel_config
-        parallel_config.data_parallel_size = new_data_parallel_size
-        if isinstance(self.resources.engine_manager, CoreEngineActorManager):
-            parallel_config.data_parallel_size_local = len(
-                self.resources.engine_manager.local_engine_actors
-            )
-        # Notify coordinator about scale up through existing
-        # stats_update_task connection
-        self._ensure_stats_update_task()
-        scale_up_marker = msgspec.msgpack.encode(
-            ("SCALE_ELASTIC_EP", new_data_parallel_size)
-        )
-        await self.first_req_send_socket.send(scale_up_marker)
-
-        logger.info(
-            "[Elastic EP] Scale up completed, new data parallel size: %s",
-            new_data_parallel_size,
-        )
-        await self.resume_scheduler_async()
+            with record_commit_stage("resume_schedulers"):
+                await self.resume_scheduler_async()
 
     async def _prepare_scale_down_elastic_ep(self, new_data_parallel_size: int) -> None:
         self._setup_elastic_ep_reconfig_bootstrap()
@@ -1744,59 +1763,76 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         """Scale down the data parallel size by shutting down and
         reconfiguring existing engine cores."""
         cur_data_parallel_size = len(self.core_engines)
-
-        self.eep_scaling_cache = ElasticScalingCache(
-            existing_core_engines=self.core_engines.copy(),
-            num_new_core_engines=new_data_parallel_size - cur_data_parallel_size,
-            pending_notifications=dict(),
-        )
-
-        old_core_engines = self.core_engines
-        # NOTE(yongji): Immediately stop sending requests to the removing engines.
-        self.core_engines = old_core_engines[:new_data_parallel_size]
-        self.lb_engines = self.lb_engines[:new_data_parallel_size]
-        removed_dp_size = cur_data_parallel_size - new_data_parallel_size
-        pause_modes = ["keep"] * new_data_parallel_size + ["abort"] * removed_dp_size
-        pause_futures = [
-            self._call_utility_async("pause_scheduler", mode, False, engine=engine)
-            for mode, engine in zip(pause_modes, old_core_engines)
-        ]
-        await asyncio.gather(*pause_futures)
-        assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
-        self.resources.engine_manager.remove_run_refs_for_scale_down(removed_dp_size)
-        wait_future = self._eep_wait_for_setup_switch_complete()
-        reconfig_futures = []
-        for cur_dp_rank, engine in enumerate(old_core_engines):
-            if cur_dp_rank < new_data_parallel_size:
-                coro = self._call_utility_async(
-                    "commit_prepared_elastic_ep", engine=engine
-                )
-            else:
-                reconfig_request = self._make_reconfig_request(
-                    new_data_parallel_size,
-                    ReconfigureRankType.SHUTDOWN_CURRENT_RANK,
-                )
-                coro = self._call_utility_async(
-                    "reinitialize_distributed", reconfig_request, engine=engine
-                )
-            reconfig_futures.append(asyncio.create_task(coro))
-
-        try:
-            await asyncio.gather(*reconfig_futures)
-
-            self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-            self._ensure_stats_update_task()
-            scale_down_marker = msgspec.msgpack.encode(
-                ("SCALE_ELASTIC_EP", new_data_parallel_size)
+        with collect_commit_timing(
+            "core_client",
+            "scale_down",
+            old_dp_size=cur_data_parallel_size,
+            new_dp_size=new_data_parallel_size,
+        ):
+            self.eep_scaling_cache = ElasticScalingCache(
+                existing_core_engines=self.core_engines.copy(),
+                num_new_core_engines=new_data_parallel_size - cur_data_parallel_size,
+                pending_notifications=dict(),
             )
-            await self.first_req_send_socket.send(scale_down_marker)
-            await wait_future
-            await self.resume_scheduler_async()
-        except Exception:
-            wait_future.cancel()
-            raise
 
-        logger.info(
-            "[Elastic EP] Scale down completed, new data parallel size: %s",
-            new_data_parallel_size,
-        )
+            old_core_engines = self.core_engines
+            # NOTE(yongji): Immediately stop sending requests to removing engines.
+            self.core_engines = old_core_engines[:new_data_parallel_size]
+            self.lb_engines = self.lb_engines[:new_data_parallel_size]
+            removed_dp_size = cur_data_parallel_size - new_data_parallel_size
+            pause_modes = ["keep"] * new_data_parallel_size + [
+                "abort"
+            ] * removed_dp_size
+            pause_futures = [
+                self._call_utility_async("pause_scheduler", mode, False, engine=engine)
+                for mode, engine in zip(pause_modes, old_core_engines)
+            ]
+            with record_commit_stage("pause_schedulers"):
+                await asyncio.gather(*pause_futures)
+            assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
+            with record_commit_stage("remove_engine_run_refs"):
+                self.resources.engine_manager.remove_run_refs_for_scale_down(
+                    removed_dp_size
+                )
+            wait_future = self._eep_wait_for_setup_switch_complete()
+            reconfig_futures = []
+            for cur_dp_rank, engine in enumerate(old_core_engines):
+                if cur_dp_rank < new_data_parallel_size:
+                    coro = self._call_utility_async(
+                        "commit_prepared_elastic_ep", engine=engine
+                    )
+                else:
+                    reconfig_request = self._make_reconfig_request(
+                        new_data_parallel_size,
+                        ReconfigureRankType.SHUTDOWN_CURRENT_RANK,
+                    )
+                    coro = self._call_utility_async(
+                        "reinitialize_distributed", reconfig_request, engine=engine
+                    )
+                reconfig_futures.append(asyncio.create_task(coro))
+
+            try:
+                with record_commit_stage("send_commit_requests"):
+                    await asyncio.gather(*reconfig_futures)
+
+                with record_commit_stage("publish_remaining_engines"):
+                    self.vllm_config.parallel_config.data_parallel_size = (
+                        new_data_parallel_size
+                    )
+                    self._ensure_stats_update_task()
+                    scale_down_marker = msgspec.msgpack.encode(
+                        ("SCALE_ELASTIC_EP", new_data_parallel_size)
+                    )
+                    await self.first_req_send_socket.send(scale_down_marker)
+                with record_commit_stage("wait_for_reconfiguration_finished"):
+                    await wait_future
+                with record_commit_stage("resume_schedulers"):
+                    await self.resume_scheduler_async()
+            except Exception:
+                wait_future.cancel()
+                raise
+
+            logger.info(
+                "[Elastic EP] Scale down completed, new data parallel size: %s",
+                new_data_parallel_size,
+            )

@@ -1358,9 +1358,12 @@ def _replace_active_groups(
     function together.  Pass all-``None`` to tear down without replacement.
     """
     global _WORLD, _DP, _EP, _EPLB, _NODE_COUNT
-    for group in (_DP, _EP, _WORLD, _EPLB):
+    from vllm.distributed.elastic_ep.timing import record_commit_stage
+
+    for name, group in (("dp", _DP), ("ep", _EP), ("world", _WORLD), ("eplb", _EPLB)):
         if group is not None:
-            group.destroy()
+            with record_commit_stage(f"switch.destroy_old_groups.{name}"):
+                group.destroy()
     _WORLD = world
     _DP = dp
     _EP = ep
