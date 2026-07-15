@@ -306,6 +306,16 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
+        self._warm_target_groups(standby_dp_group, get_standby_ep_group())
+
+    def _warm_target_groups(self, dp_group, ep_group) -> None:
+        assert ep_group is not None
+        stream = torch.Stream(device=dp_group.device)
+        with stream:
+            tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
+            for group in (dp_group, ep_group):
+                torch.distributed.all_reduce(tensor, group=group.device_group)
+        stream.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -667,6 +677,7 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
+        self._warm_target_groups(get_dp_group(), get_ep_group())
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
