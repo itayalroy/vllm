@@ -17,8 +17,9 @@ from ..utils import RemoteOpenAIServer, multi_gpu_test
 @pytest.fixture(autouse=True)
 def cleanup_ray_between_tests():
     """Force-stop any lingering Ray processes between tests."""
-    subprocess.run(["ray", "stop", "--force"], timeout=30, capture_output=True)
-    time.sleep(5)
+    if not os.getenv("VLLM_TEST_ELASTIC_EP_EXTERNAL_RAY"):
+        subprocess.run(["ray", "stop", "--force"], timeout=30, capture_output=True)
+        time.sleep(5)
     yield
 
 
