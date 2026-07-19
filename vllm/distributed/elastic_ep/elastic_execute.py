@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import P2POp
 
+from vllm.compilation.compiler_interface import trigger_inductor_lazy_init
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -807,6 +808,9 @@ class ElasticEPScalingExecutor:
     def warmup_local_kernels(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             kernel_warmup(self.worker, process_local_only=True)
+        config = self.worker.vllm_config.compilation_config
+        if config.mode != CompilationMode.NONE and config.backend == "inductor":
+            trigger_inductor_lazy_init(self.worker.device)
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
