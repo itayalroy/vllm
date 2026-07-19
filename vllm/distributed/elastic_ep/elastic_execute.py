@@ -50,6 +50,7 @@ from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
 )
+from vllm.model_executor.warmup.kernel_warmup import warm_v1_block_table
 from vllm.utils import is_moe_layer
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
@@ -781,6 +782,7 @@ class ElasticEPScalingExecutor:
     def prepare_new_worker(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+        warm_v1_block_table(self.worker)
         config = self.worker.vllm_config.compilation_config
         if config.mode != CompilationMode.NONE and config.backend == "inductor":
             trigger_inductor_lazy_init(self.worker.device)

@@ -44,11 +44,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def kernel_warmup(worker: "Worker"):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
-    )
-
+def warm_v1_block_table(worker: "Worker") -> None:
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
         with record_commit_stage("kernel_warmup.v1_block_table", synchronize_gpu=True):
@@ -56,6 +52,14 @@ def kernel_warmup(worker: "Worker"):
                 getattr(worker.model_runner, "device", torch.device("cuda")),
                 worker.scheduler_config.max_num_batched_tokens,
             )
+
+
+def kernel_warmup(worker: "Worker"):
+    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+        minimax_m3_msa_warmup,
+    )
+
+    warm_v1_block_table(worker)
     with record_commit_stage("kernel_warmup.qwen_triton", synchronize_gpu=True):
         qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
