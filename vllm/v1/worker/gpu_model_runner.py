@@ -227,7 +227,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import lock_workspace, reserve_workspace_capacity
 
 from .utils import (
     AttentionGroup,
@@ -6419,6 +6419,11 @@ class GPUModelRunner(
         self._sync_device()
         del hidden_states, output
         self.encoder_cache.clear()
+        max_dp_size = envs.VLLM_ELASTIC_EP_MAX_DP_SIZE
+        dp_size = self.parallel_config.data_parallel_size
+        if self.parallel_config.enable_elastic_ep and max_dp_size > dp_size:
+            # EEP expands the MoE workspace linearly with DP size.
+            reserve_workspace_capacity(max_dp_size / dp_size)
         gc.collect()
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:

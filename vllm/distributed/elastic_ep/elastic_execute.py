@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import P2POp
 
+import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -799,8 +800,6 @@ class ElasticEPScalingExecutor:
         # any captured CUDA graph with a stale data pointer; drop graphs
         # before re-warm so captures realign with the resized buffer.
         self._release_cuda_graphs("warmup.release_cuda_graphs")
-        with record_commit_stage("warmup.workspace_unlock"):
-            unlock_workspace()
 
         # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
         # alone only exercises cudagraph-capture sizes and can leave the
@@ -808,8 +807,18 @@ class ElasticEPScalingExecutor:
         # directly with skip_eplb=True so dummy routing doesn't pollute the
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
-        with record_commit_stage("warmup.max_tokens_workspace", synchronize_gpu=True):
-            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+        if (
+            self.worker.vllm_config.parallel_config.data_parallel_size
+            > envs.VLLM_ELASTIC_EP_MAX_DP_SIZE
+        ):
+            with record_commit_stage("warmup.workspace_unlock"):
+                unlock_workspace()
+            with record_commit_stage(
+                "warmup.max_tokens_workspace", synchronize_gpu=True
+            ):
+                runner._dummy_run(
+                    runner.max_num_tokens, is_profile=True, skip_eplb=True
+                )
         self.worker.compile_or_warm_up_model()
 
         with record_commit_stage("warmup.workspace_lock"):

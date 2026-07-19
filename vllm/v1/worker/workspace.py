@@ -4,7 +4,7 @@
 import inspect
 import os
 from itertools import accumulate
-from math import prod
+from math import ceil, prod
 
 import torch
 
@@ -256,6 +256,14 @@ def lock_workspace() -> None:
         # Now all get_workspace calls must fit in pre-allocated size
     """
     current_workspace_manager().lock()
+
+
+def reserve_workspace_capacity(multiplier: float) -> None:
+    """Reserve a multiple of the workspace capacity discovered by profiling."""
+    manager = current_workspace_manager()
+    workspace = manager._current_workspaces[dbo_current_ubatch_id()]
+    size = manager._workspace_size_bytes(workspace)
+    manager._ensure_workspace_size(round_up(ceil(size * multiplier), _MB))
 
 
 def unlock_workspace() -> None:
