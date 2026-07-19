@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch.distributed import P2POp
 
 import vllm.envs as envs
+from vllm.compilation.compiler_interface import trigger_inductor_lazy_init
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -50,6 +51,7 @@ from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
 )
 from vllm.utils import is_moe_layer
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
@@ -779,6 +781,10 @@ class ElasticEPScalingExecutor:
     def prepare_new_worker(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             prepare_communication_buffer_for_model(self.worker.model_runner.get_model())
+        config = self.worker.vllm_config.compilation_config
+        if config.mode != CompilationMode.NONE and config.backend == "inductor":
+            trigger_inductor_lazy_init(self.worker.device)
+        freeze_gc_heap()
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
