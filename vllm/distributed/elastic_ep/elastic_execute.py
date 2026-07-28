@@ -826,15 +826,7 @@ class ElasticEPScalingExecutor:
         with record_commit_stage("warmup.workspace_unlock"):
             unlock_workspace()
 
-        # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
-        # alone only exercises cudagraph-capture sizes and can leave the
-        # workspace too small for post-reshuffle routing. Use _dummy_run
-        # directly with skip_eplb=True so dummy routing doesn't pollute the
-        # just-rebalanced EPLB stats.
-        runner = self.worker.model_runner
-        with record_commit_stage("warmup.max_tokens_workspace", synchronize_gpu=True):
-            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        self.worker.compile_or_warm_up_model(warmup_max_tokens=True)
 
         with record_commit_stage("warmup.workspace_lock"):
             lock_workspace()

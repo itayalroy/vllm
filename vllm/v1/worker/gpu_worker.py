@@ -676,7 +676,9 @@ class Worker(WorkerBase):
             self.model_runner._init_kv_zero_meta()
 
     @instrument(span_name="Warmup (GPU)")
-    def compile_or_warm_up_model(self) -> CompilationTimes:
+    def compile_or_warm_up_model(
+        self, warmup_max_tokens: bool = False
+    ) -> CompilationTimes:
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -712,7 +714,7 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        kernel_warmup(self, warmup_max_tokens=warmup_max_tokens)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:

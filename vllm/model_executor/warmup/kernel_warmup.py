@@ -94,7 +94,12 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
 
-def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
+def kernel_warmup(
+    worker: "Worker",
+    *,
+    process_local_only: bool = False,
+    warmup_max_tokens: bool = False,
+):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
@@ -171,6 +176,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         worker.vllm_config.kernel_config.enable_flashinfer_autotune
     )
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
+    did_max_tokens_warmup = False
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
@@ -178,6 +184,12 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
             "kernel_warmup.flashinfer_autotune", synchronize_gpu=True
         ):
             flashinfer_autotune(worker.model_runner)
+        did_max_tokens_warmup = True
+
+    if warmup_max_tokens and not did_max_tokens_warmup:
+        worker.model_runner._dummy_run(
+            worker.model_runner.max_num_tokens, is_profile=True, skip_eplb=True
+        )
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
