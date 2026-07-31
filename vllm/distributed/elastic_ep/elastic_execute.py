@@ -51,6 +51,7 @@ from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
 )
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.utils import is_moe_layer
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
@@ -814,6 +815,7 @@ class ElasticEPScalingExecutor:
         config = self.worker.vllm_config.compilation_config
         if config.mode != CompilationMode.NONE and config.backend == "inductor":
             trigger_inductor_lazy_init(self.worker.device)
+        freeze_gc_heap()
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
