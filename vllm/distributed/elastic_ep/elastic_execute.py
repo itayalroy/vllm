@@ -3,7 +3,7 @@
 import gc
 import time
 import weakref
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -65,6 +65,17 @@ if TYPE_CHECKING:
     )
 
 
+def _contiguous_segments(tensor: torch.Tensor) -> Iterator[torch.Tensor]:
+    pending = [tensor]
+    while pending:
+        segment = pending.pop()
+        if segment.is_contiguous():
+            yield segment
+        else:
+            dim = max(range(segment.ndim), key=segment.stride().__getitem__)
+            pending.extend(reversed(segment.unbind(dim)))
+
+
 def batch_transfer_weights(
     model: nn.Module,
     is_sender: bool,
@@ -93,24 +104,15 @@ def batch_transfer_weights(
     assert len(all_params) > 0
     p2p_ops = []
     for param in all_params:
-        transfer_param = param
+        for transfer_param in _contiguous_segments(param):
+            op = object.__new__(P2POp)
+            op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
+            op.tensor = transfer_param
+            op.group_peer = peer_rank
+            p2p_ops.append(op)
         if not param.is_contiguous():
-            # PyNccl transfers flat memory and does not honor tensor strides.
-            transfer_param = (
-                param.contiguous()
-                if is_sender
-                else torch.empty_like(param, memory_format=torch.contiguous_format)
-            )
-        op = object.__new__(P2POp)
-        op.op = torch.distributed.isend if is_sender else torch.distributed.irecv
-        op.tensor = transfer_param
-        op.group_peer = peer_rank
-        p2p_ops.append(op)
-        if transfer_param is not param:
             device_comm.batch_isend_irecv(p2p_ops)
             p2p_ops.clear()
-            if not is_sender:
-                param.copy_(transfer_param)
     if p2p_ops:
         device_comm.batch_isend_irecv(p2p_ops)
 
