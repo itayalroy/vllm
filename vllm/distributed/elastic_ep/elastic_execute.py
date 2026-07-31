@@ -846,7 +846,13 @@ class ElasticEPScalingExecutor:
         runner = self.worker.model_runner
         with record_commit_stage("warmup.max_tokens_workspace", synchronize_gpu=True):
             runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        config = self.worker.vllm_config.compilation_config
+        num_warmups = config.cudagraph_num_of_warmups
+        config.cudagraph_num_of_warmups = 0
+        try:
+            self.worker.compile_or_warm_up_model()
+        finally:
+            config.cudagraph_num_of_warmups = num_warmups
 
         with record_commit_stage("warmup.workspace_lock"):
             lock_workspace()
