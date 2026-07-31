@@ -91,6 +91,14 @@ def test_custom_op():
             CompilationConfig(custom_ops=custom_ops)
 
 
+def test_custom_op_diagnostics_do_not_affect_hash():
+    config = CompilationConfig()
+    expected_hash = config.compute_hash()
+    config.enabled_custom_ops["rms_norm"] += 1
+    config.disabled_custom_ops["silu_and_mul"] += 1
+    assert config.compute_hash() == expected_hash
+
+
 @pytest.mark.parametrize(
     ("custom_ops", "config_kwargs", "match"),
     [
