@@ -1029,7 +1029,12 @@ class AsyncLLM(EngineClient):
             )
             return
 
+        prepare_start = time.perf_counter()
         await self.engine_core.prepare_elastic_ep(new_data_parallel_size)
+        logger.info(
+            "[Elastic EP transfer benchmark] prepare_seconds=%.6f",
+            time.perf_counter() - prepare_start,
+        )
 
         # recreate stat loggers
         if new_data_parallel_size > old_data_parallel_size and self.log_stats:
