@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import time
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -267,6 +268,7 @@ class ElasticEPScalingExecutor:
         ranks_to_send = list(range(old_dp_size + recv_begin, old_dp_size + recv_end))
 
         model = self.worker.model_runner.get_model()
+        transfer_start = time.perf_counter()
         for new_worker_rank in sorted(ranks_to_send):
             batch_transfer_weights(
                 model=model,
@@ -276,6 +278,14 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
+        if ranks_to_send:
+            logger.info(
+                "[Elastic EP transfer benchmark] role=sender dp_rank=%d "
+                "peers=%d weight_transfer_seconds=%.6f",
+                dp_rank,
+                len(ranks_to_send),
+                time.perf_counter() - transfer_start,
+            )
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -612,6 +622,7 @@ class ElasticEPScalingExecutor:
             for module in model.modules()
             if is_moe_layer(module)
         ]
+        transfer_start = time.perf_counter()
         batch_transfer_weights(
             model=model,
             is_sender=False,
@@ -620,6 +631,13 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
+        logger.info(
+            "[Elastic EP transfer benchmark] role=receiver dp_rank=%d "
+            "peer=%d weight_transfer_seconds=%.6f",
+            dp_rank,
+            sender_rank,
+            time.perf_counter() - transfer_start,
+        )
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
