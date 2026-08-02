@@ -6528,6 +6528,7 @@ class GPUModelRunner(
     @staticmethod
     @contextmanager
     def _freeze_gc():
+        already_frozen = gc.get_freeze_count() > 0
         gc.collect()
         should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
         if should_freeze:
@@ -6535,7 +6536,7 @@ class GPUModelRunner(
         try:
             yield
         finally:
-            if should_freeze:
+            if should_freeze and not already_frozen:
                 gc.unfreeze()
                 gc.collect()
 

@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
 )
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.utils import is_moe_layer
+from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
@@ -378,8 +379,7 @@ class ElasticEPScalingExecutor:
 
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
-            wrapper = self.worker.model_runner.model
-            wrapper.concrete_cudagraph_entries = {}
+            CUDAGraphWrapper.clear_all_graphs()
 
         elif isinstance(self.worker.model_runner.model, UBatchWrapper):
             raise RuntimeError("DBO is not yet supported in elastic EP")
@@ -406,6 +406,7 @@ class ElasticEPScalingExecutor:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
+        gc.unfreeze()
         self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
         self._start_group_cleanup(retired_groups)
@@ -706,6 +707,7 @@ class ElasticEPScalingExecutor:
     def warmup_local_kernels(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             kernel_warmup(self.worker, process_local_only=True)
+        freeze_gc_heap()
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
