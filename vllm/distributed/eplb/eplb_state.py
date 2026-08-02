@@ -982,23 +982,30 @@ class EplbState:
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
         parallel_state = get_ep_group()
         has_result = int(model_state.pending_result is not None)
+        worker_failed = (
+            self.async_worker is not None and not self.async_worker.is_alive()
+        )
 
         cpu_group = getattr(parallel_state, "cpu_group", None)
         if cpu_group is not None and cpu_group.size() > 1:
-            flag = torch.tensor((has_result,), dtype=torch.int32, device="cpu")
-            all_reduce(flag, group=cpu_group)
-            return int(flag.item()) == cpu_group.size()
+            group, device = cpu_group, "cpu"
+        else:
+            group = parallel_state.device_group
+            if group.size() <= 1:
+                if worker_failed:
+                    raise RuntimeError("Async EPLB worker failed")
+                return bool(has_result)
+            device = getattr(
+                parallel_state, "device", model_state.physical_to_logical_map.device
+            )
 
-        device_group = parallel_state.device_group
-        if device_group.size() <= 1:
-            return bool(has_result)
-
-        device = getattr(
-            parallel_state, "device", model_state.physical_to_logical_map.device
+        status = torch.tensor(
+            (has_result, int(worker_failed)), dtype=torch.int32, device=device
         )
-        flag = torch.tensor((has_result,), dtype=torch.int32, device=device)
-        all_reduce(flag, group=device_group)
-        return int(flag.item()) == device_group.size()
+        all_reduce(status, group=group)
+        if status[1].item():
+            raise RuntimeError("Async EPLB worker failed")
+        return int(status[0].item()) == group.size()
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """
