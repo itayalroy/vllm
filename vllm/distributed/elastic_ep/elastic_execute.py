@@ -525,7 +525,9 @@ class ElasticEPScalingExecutor:
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
 
     def _perform_eplb_reshuffle(
-        self, rank_mapping: dict[int, int] | None = None
+        self,
+        rank_mapping: dict[int, int] | None = None,
+        async_op: bool = False,
     ) -> None:
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Starting expert resharding...")
@@ -536,13 +538,15 @@ class ElasticEPScalingExecutor:
         model_config = self.worker.model_runner.model_config
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
         is_async_enabled = eplb_state.is_async
-        eplb_state.is_async = False
+        run_async = async_op and is_async_enabled
+        eplb_state.is_async = run_async
         if rank_mapping is None:
             eplb_state.rearrange()
         else:
             eplb_state.rearrange(rank_mapping=rank_mapping)
-        # NOTE(yongji): check whether we need to synchronize here
-        torch.accelerator.synchronize()
+        if not run_async:
+            # NOTE(yongji): check whether we need to synchronize here
+            torch.accelerator.synchronize()
         # reset expert_rearrangement_step to ensure all ranks are synchronized
         eplb_state.expert_rearrangement_step = 0
         eplb_state.num_valid_physical_experts = (
@@ -555,7 +559,10 @@ class ElasticEPScalingExecutor:
         # groups aren't ready yet.
         eplb_state.start_async_loop()
         if get_ep_group().rank == 0:
-            logger.info("[Elastic EP] Expert resharding completed")
+            logger.info(
+                "[Elastic EP] Expert resharding %s",
+                "scheduled" if run_async else "completed",
+            )
 
     def commit_scale_up(self, is_existing_worker: bool) -> None:
         if is_existing_worker:
@@ -564,8 +571,14 @@ class ElasticEPScalingExecutor:
         else:
             mapping, _, num_valid_experts = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
-        self._perform_eplb_reshuffle()
-        self.warm_and_capture()
+        eplb_state = self.worker.model_runner.eplb_state
+        assert eplb_state is not None
+        if eplb_state.is_async:
+            self.warm_and_capture()
+            self._perform_eplb_reshuffle(async_op=True)
+        else:
+            self._perform_eplb_reshuffle()
+            self.warm_and_capture()
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)
