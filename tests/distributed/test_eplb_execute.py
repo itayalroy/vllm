@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.distributed
 
+import vllm.distributed.eplb.eplb_state as eplb_state_module
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.eplb.eplb_communicator import (
+    NixlEplbCommunicator,
     create_eplb_communicator,
     has_nixl,
 )
@@ -791,9 +794,7 @@ def _test_nixl_deferred_init_worker(
     num_local_experts: int,
     num_logical_experts: int,
 ) -> None:
-    """Exercise NixlEplbCommunicator with defer_remote_setup=True (elastic EP path)."""
-    from vllm.distributed.eplb.eplb_communicator import NixlEplbCommunicator
-
+    """Exercise NixlEplbCommunicator with defer_init=True (elastic EP path)."""
     set_env_vars_and_device(env)
 
     vllm_config = VllmConfig()
@@ -842,9 +843,10 @@ def _test_nixl_deferred_init_worker(
             cpu_group=ep_group_coordinator.cpu_group,
             all_expert_weights=expert_weights,
             expert_buffer=expert_buffer,
-            defer_remote_setup=True,
+            defer_init=True,
         )
         assert not communicator._remote_state_initialized
+        assert communicator._nixl_wrapper is None
 
         rearrange_expert_weights_inplace(
             old_indices,
@@ -856,6 +858,7 @@ def _test_nixl_deferred_init_worker(
         )
 
         assert communicator._remote_state_initialized
+        assert communicator._nixl_wrapper is not None
 
     local_ok = verify_expert_weights_after_shuffle(
         expert_weights,
@@ -882,6 +885,33 @@ def _test_nixl_deferred_init_worker(
     )
 
 
+def test_nixl_deferred_init_failure_is_propagated(monkeypatch):
+    communicator = object.__new__(NixlEplbCommunicator)
+    communicator._world_size = 2
+    communicator._cpu_group = object()
+    error = RuntimeError("local failure")
+    monkeypatch.setattr(communicator, "_init_local_state", Mock(side_effect=error))
+
+    def gather_metadata(output, value, group):
+        assert value is None
+        output[:] = [None, b"peer"]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_metadata)
+    with pytest.raises(RuntimeError, match="initialization failed") as exc_info:
+        communicator._init_remote_agents()
+    assert exc_info.value.__cause__ is error
+
+    state = object.__new__(eplb_state_module.EplbState)
+    state.async_worker = Mock()
+    state.async_worker.is_alive.return_value = False
+    group = Mock(cpu_group=None)
+    group.device_group.size.return_value = 1
+    monkeypatch.setattr(eplb_state_module, "get_ep_group", lambda: group)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        state._all_ranks_result_ready(Mock(pending_result=None))
+
+
 @pytest.mark.skipif(not has_nixl(), reason="NIXL is not available")
 @pytest.mark.parametrize(
     "world_size,num_layers,num_local_experts,num_logical_experts",
@@ -893,7 +923,7 @@ def test_nixl_deferred_init(
     num_local_experts,
     num_logical_experts,
 ):
-    """Test NixlEplbCommunicator with defer_remote_setup=True (elastic EP path)."""
+    """Test NixlEplbCommunicator with defer_init=True (elastic EP path)."""
 
     if torch.accelerator.device_count() < world_size:
         pytest.skip(f"Need at least {world_size} GPUs to run the test")
