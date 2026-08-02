@@ -755,9 +755,9 @@ class EplbState:
         # Map the physical expert load to global logical experts
         global_expert_load_windows = []
         for eplb_model_state in self.model_states.values():
-            expert_load_window = eplb_model_state.expert_load_window[
-                :, :, : self.num_valid_physical_experts
-            ]
+            expert_load_window = eplb_model_state.expert_load_window
+            physical_to_logical = eplb_model_state.physical_to_logical_map
+            valid_mask = physical_to_logical >= 0
             logical_expert_load_window = torch.zeros(
                 self.expert_load_window_size,
                 eplb_model_state.model.num_moe_layers,
@@ -767,13 +767,11 @@ class EplbState:
             )
             logical_expert_load_window.scatter_add_(
                 dim=-1,
-                index=eplb_model_state.physical_to_logical_map[
-                    :, : self.num_valid_physical_experts
-                ]
+                index=physical_to_logical.clamp_min(0)
                 .unsqueeze(0)
                 .expand_as(expert_load_window)
                 .long(),
-                src=expert_load_window,
+                src=expert_load_window * valid_mask.unsqueeze(0),
             )
 
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
@@ -947,7 +945,7 @@ class EplbState:
 
         Each pending result is acknowledged (consumed_event recorded) so the
         async worker can proceed, but the transferred weights are intentionally
-        NOT applied — a full synchronous rearrange is expected to follow.
+        NOT applied — a full rearrange is expected to follow.
 
         Ranks are kept in lockstep via _all_ranks_result_ready (all_reduce
         on the EP CPU group).  The async worker's coordinated-stop collectives
