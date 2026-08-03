@@ -6861,7 +6861,7 @@ class GPUModelRunner(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
 
-        with self._freeze_gc(), graph_capture(device=self.device):
+        with graph_capture(device=self.device):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
