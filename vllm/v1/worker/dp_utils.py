@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import time
+
 import torch
 import torch.distributed as dist
 
@@ -13,6 +15,8 @@ from vllm.v1.worker.ubatch_utils import (
 )
 
 logger = init_logger(__name__)
+
+_seen_dp_groups: set[str] = set()
 
 
 def _get_device_and_group(parallel_config: ParallelConfig):
@@ -42,7 +46,22 @@ def _run_ar(
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
+    dp_group = get_dp_group()
     device, group = _get_device_and_group(parallel_config)
+    first_use = group.group_name not in _seen_dp_groups
+    if first_use:
+        _seen_dp_groups.add(group.group_name)
+        logger.warning(
+            "[EEP PG] all_reduce_begin t=%d global_rank=%d name=%s "
+            "world_size=%d device=%s device_port=%s cpu_port=%s",
+            time.monotonic_ns(),
+            dp_group.rank,
+            dp_group.unique_name,
+            dp_group.world_size,
+            device,
+            getattr(dp_group, "_device_group_port", None),
+            getattr(dp_group, "_cpu_group_port", None),
+        )
     # Populate this rank's contribution on CPU to reduce GPU syncs.
     tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)
     tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch
@@ -50,7 +69,26 @@ def _run_ar(
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
     tensor = tensor_cpu.to(device, non_blocking=True)
-    dist.all_reduce(tensor, group=group)
+    try:
+        dist.all_reduce(tensor, group=group)
+    except BaseException:
+        logger.exception(
+            "[EEP PG] all_reduce_failed t=%d global_rank=%d name=%s "
+            "device_port=%s cpu_port=%s",
+            time.monotonic_ns(),
+            dp_group.rank,
+            dp_group.unique_name,
+            getattr(dp_group, "_device_group_port", None),
+            getattr(dp_group, "_cpu_group_port", None),
+        )
+        raise
+    if first_use:
+        logger.warning(
+            "[EEP PG] all_reduce_end t=%d global_rank=%d name=%s",
+            time.monotonic_ns(),
+            dp_group.rank,
+            dp_group.unique_name,
+        )
     return tensor
 
 

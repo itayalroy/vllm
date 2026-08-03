@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import time
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -216,9 +217,27 @@ class ElasticEPScalingExecutor:
         from vllm.platforms import current_platform
 
         current_platform.set_device(self.worker.device)
-        for group in groups:
+        for role, group in zip(("dp", "ep", "world", "eplb"), groups, strict=True):
             if group is not None:
+                logger.warning(
+                    "[EEP PG] destroy_begin t=%d role=%s name=%s "
+                    "global_rank=%d world_size=%d device_port=%s cpu_port=%s",
+                    time.monotonic_ns(),
+                    role,
+                    group.unique_name,
+                    group.rank,
+                    group.world_size,
+                    getattr(group, "_device_group_port", None),
+                    getattr(group, "_cpu_group_port", None),
+                )
                 group.destroy()
+                logger.warning(
+                    "[EEP PG] destroy_end t=%d role=%s name=%s global_rank=%d",
+                    time.monotonic_ns(),
+                    role,
+                    group.unique_name,
+                    group.rank,
+                )
 
     def _start_group_cleanup(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
         assert self._group_cleanup_future is None
@@ -417,7 +436,20 @@ class ElasticEPScalingExecutor:
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs()
-        retired_groups = _replace_active_groups(**pop_standby_groups())
+        old_dp_group = get_dp_group()
+        standby_groups = pop_standby_groups()
+        new_dp_group = standby_groups["dp"]
+        logger.warning(
+            "[EEP PG] swap t=%d global_rank=%d old_name=%s old_cpu_port=%s "
+            "new_name=%s new_cpu_port=%s",
+            time.monotonic_ns(),
+            old_dp_group.rank,
+            old_dp_group.unique_name,
+            getattr(old_dp_group, "_cpu_group_port", None),
+            new_dp_group.unique_name,
+            getattr(new_dp_group, "_cpu_group_port", None),
+        )
+        retired_groups = _replace_active_groups(**standby_groups)
         self._start_group_cleanup(retired_groups)
 
         parallel_config = self.worker.vllm_config.parallel_config
@@ -746,7 +778,25 @@ class ElasticEPScalingExecutor:
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        dp_group = get_dp_group()
+        logger.warning(
+            "[EEP PG] warm_capture_begin t=%d global_rank=%d name=%s "
+            "device_port=%s cpu_port=%s",
+            time.monotonic_ns(),
+            dp_group.rank,
+            dp_group.unique_name,
+            getattr(dp_group, "_device_group_port", None),
+            getattr(dp_group, "_cpu_group_port", None),
+        )
+        try:
+            self.worker.compile_or_warm_up_model()
+        finally:
+            logger.warning(
+                "[EEP PG] warm_capture_end t=%d global_rank=%d name=%s",
+                time.monotonic_ns(),
+                dp_group.rank,
+                dp_group.unique_name,
+            )
 
         lock_workspace()
 
