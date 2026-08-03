@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import socket
 import struct
+import time
 from typing import Any, Optional
 
 import torch
@@ -122,6 +123,8 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     ports = _fetch_group_ports(key, coord_store)
                     socks = []
                 device_port, cpu_port, tcp_store_port = ports
+                self._device_group_port = device_port
+                self._cpu_group_port = cpu_port
 
                 device_group = stateless_init_torch_distributed_process_group(
                     host=host,
@@ -152,6 +155,18 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 self_device_group = device_group
                 self_cpu_group = cpu_group
                 self_tcp_store_group = tcp_store_group
+
+                logger.warning(
+                    "[EEP PG] create t=%d name=%s global_rank=%d "
+                    "group_rank=%d world_size=%d device_port=%d cpu_port=%d",
+                    time.monotonic_ns(),
+                    self.unique_name,
+                    self.rank,
+                    self.rank_in_group,
+                    self.world_size,
+                    device_port,
+                    cpu_port,
+                )
 
         assert self_cpu_group is not None
         assert self_device_group is not None
