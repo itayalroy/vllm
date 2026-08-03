@@ -412,13 +412,12 @@ class ElasticEPScalingExecutor:
         # Finish collective cleanup before this worker is shut down.
         self._wait_for_group_cleanup()
 
-    def switch_and_prepare(self) -> None:
+    def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
-        self._start_group_cleanup(retired_groups)
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -562,6 +561,8 @@ class ElasticEPScalingExecutor:
             compilation_counter.stock_torch_compile_count += 1
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
 
+        return retired_groups
+
     def _perform_eplb_reshuffle(
         self,
         rank_mapping: dict[int, int] | None = None,
@@ -602,7 +603,7 @@ class ElasticEPScalingExecutor:
     def commit_scale_up(self, is_existing_worker: bool) -> None:
         if is_existing_worker:
             self.broadcast_expert_mapping()
-            self.switch_and_prepare()
+            retired_groups = self.switch_and_prepare()
         else:
             mapping, _, num_valid_experts = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
@@ -614,14 +615,17 @@ class ElasticEPScalingExecutor:
         else:
             self._perform_eplb_reshuffle()
             self.warm_and_capture()
+        if is_existing_worker:
+            self._start_group_cleanup(retired_groups)
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)
         if removing:
             self.switch_and_remove()
         else:
-            self.switch_and_prepare()
+            retired_groups = self.switch_and_prepare()
             self.warm_and_capture()
+            self._start_group_cleanup(retired_groups)
 
     def perform_scale_down_eplb_reshuffle(self, new_dp_size: int) -> None:
         eplb_state = self.worker.model_runner.eplb_state
