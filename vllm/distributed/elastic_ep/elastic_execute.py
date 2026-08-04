@@ -28,9 +28,14 @@ from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
     get_standby_ep_group,
+    get_standby_eplb_group,
     pop_standby_groups,
 )
-from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
+from vllm.distributed.eplb.eplb_communicator import (
+    EplbCommunicator,
+    NixlEplbCommunicator,
+    create_eplb_communicator,
+)
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _replace_active_groups,
@@ -150,6 +155,9 @@ class ElasticEPScalingExecutor:
         self.worker_ref = weakref.ref(worker)
         self.reconfig_request = None
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
+        self._prepared_eplb: (
+            tuple[EplbCommunicator, list[torch.Tensor] | None] | None
+        ) = None
         self._async_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ElasticEPAsync"
         )
@@ -306,7 +314,7 @@ class ElasticEPScalingExecutor:
             )
         torch.accelerator.synchronize()
 
-    def warm_target_groups(self, standby: bool = False) -> None:
+    def prepare_target_communication(self, standby: bool = False) -> None:
         dp_group = get_standby_dp_group() if standby else get_dp_group()
         ep_group = get_standby_ep_group() if standby else get_ep_group()
         assert dp_group is not None and ep_group is not None
@@ -316,6 +324,34 @@ class ElasticEPScalingExecutor:
             for group in (dp_group, ep_group):
                 torch.distributed.all_reduce(tensor, group=group.device_group)
         stream.synchronize()
+
+        parallel_config = self.worker.vllm_config.parallel_config
+        if parallel_config.eplb_config.communicator != "nixl":
+            return
+        eplb_group = get_standby_eplb_group() if standby else get_eplb_group()
+        assert eplb_group is not None
+        expert_weights = self._eplb_expert_weights()
+        prepared_buffer = None
+        if standby:
+            eplb_state = self.worker.model_runner.eplb_state
+            assert eplb_state is not None
+            model_config = self.worker.model_runner.model_config
+            expert_buffer = eplb_state.model_states[
+                model_config.compute_hash()
+            ].expert_buffer
+        else:
+            prepared_buffer = expert_buffer = [
+                torch.empty_like(w) for w in expert_weights[0]
+            ]
+        communicator = create_eplb_communicator(
+            group_coordinator=eplb_group,
+            backend=parallel_config.eplb_config.communicator,
+            expert_weights=expert_weights,
+            expert_buffer=expert_buffer,
+        )
+        assert isinstance(communicator, NixlEplbCommunicator)
+        communicator.initialize()
+        self._prepared_eplb = communicator, prepared_buffer
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -385,6 +421,14 @@ class ElasticEPScalingExecutor:
             module._replace_quant_method(staged_quant_method)
             staged_quant_method.moe_kernel.prepare_finalize.on_commit()
         self._staged_moe_quant_methods.clear()
+
+    def _eplb_expert_weights(self) -> list[list[torch.Tensor]]:
+        model = self.worker.model_runner.get_model()
+        return [
+            list(module.get_expert_weights())
+            for module in model.modules()
+            if is_moe_layer(module)
+        ]
 
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
@@ -531,18 +575,23 @@ class ElasticEPScalingExecutor:
                     module._replace_quant_method(module._quant_method.old_quant_method)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
-        eplb_model_state.expert_buffer = [
-            torch.empty_like(w) for w in model.expert_weights[0]
-        ]
-        assert parallel_config.eplb_config.communicator is not None, (
-            "EPLB communicator backend must be set by ParallelConfig"
-        )
-        eplb_model_state.communicator = create_eplb_communicator(
-            group_coordinator=get_eplb_group(),
-            backend=parallel_config.eplb_config.communicator,
-            expert_weights=model.expert_weights,
-            expert_buffer=eplb_model_state.expert_buffer,
-        )
+        if self._prepared_eplb is not None:
+            eplb_model_state.communicator, prepared_buffer = self._prepared_eplb
+            assert prepared_buffer is None
+            self._prepared_eplb = None
+        else:
+            eplb_model_state.expert_buffer = [
+                torch.empty_like(w) for w in model.expert_weights[0]
+            ]
+            assert parallel_config.eplb_config.communicator is not None, (
+                "EPLB communicator backend must be set by ParallelConfig"
+            )
+            eplb_model_state.communicator = create_eplb_communicator(
+                group_coordinator=get_eplb_group(),
+                backend=parallel_config.eplb_config.communicator,
+                expert_weights=model.expert_weights,
+                expert_buffer=eplb_model_state.expert_buffer,
+            )
 
         if (
             self.worker.vllm_config.compilation_config.mode
@@ -605,6 +654,16 @@ class ElasticEPScalingExecutor:
         else:
             mapping, _, num_valid_experts = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
+            eplb_state = self.worker.model_runner.eplb_state
+            assert eplb_state is not None
+            model_config = self.worker.model_runner.model_config
+            if self._prepared_eplb is not None:
+                eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
+                communicator, expert_buffer = self._prepared_eplb
+                assert expert_buffer is not None
+                eplb_model_state.expert_buffer = expert_buffer
+                eplb_model_state.communicator = communicator
+                self._prepared_eplb = None
         eplb_state = self.worker.model_runner.eplb_state
         assert eplb_state is not None
         if eplb_state.is_async:

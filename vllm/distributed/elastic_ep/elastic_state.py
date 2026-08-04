@@ -33,7 +33,7 @@ class ScaleUpExistingEngineState(enum.IntEnum):
     CREATE_STANDBY_GROUPS = 0
     STAGE_QUANT_METHODS = 1
     TRANSFER_WEIGHTS = 2
-    WARM_TARGET_GROUPS = 3
+    PREPARE_TARGET_COMMUNICATION = 3
     SYNC_KV_CACHE_MEMORY_SIZE = 4
     COMMIT_SCALE_UP = 5  # Blocks forward passes.
     COMPLETE = 6
@@ -182,11 +182,11 @@ class ElasticEPScalingState:
         elif state == ScaleUpExistingEngineState.TRANSFER_WEIGHTS:
             if not self._transfer_weights():
                 return False
-            self.state = ScaleUpExistingEngineState.WARM_TARGET_GROUPS
+            self.state = ScaleUpExistingEngineState.PREPARE_TARGET_COMMUNICATION
             return True
 
-        elif state == ScaleUpExistingEngineState.WARM_TARGET_GROUPS:
-            if not self._execute_async("warm_target_groups", True):
+        elif state == ScaleUpExistingEngineState.PREPARE_TARGET_COMMUNICATION:
+            if not self._execute_async("prepare_target_communication", True):
                 return False
             self.state = ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE
             return True
@@ -218,7 +218,9 @@ class ElasticEPScalingState:
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
             self._collective_rpc("elastic_ep_execute", args=("receive_weights",))
-            self._collective_rpc("elastic_ep_execute", args=("warm_target_groups",))
+            self._collective_rpc(
+                "elastic_ep_execute", args=("prepare_target_communication",)
+            )
             self.engine_core.available_gpu_memory_for_kv_cache = (
                 ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
             )
