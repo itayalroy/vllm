@@ -210,7 +210,7 @@ class ElasticEPScalingExecutor:
     def load_model(self) -> None:
         self.worker.load_model(load_dummy_weights=True)
 
-    def create_standby_groups(
+    def prepare_reconfiguration(
         self, reconfig_request: ReconfigureDistributedRequest, use_all2all: bool
     ) -> None:
         self.reconfig_request = reconfig_request
@@ -227,8 +227,9 @@ class ElasticEPScalingExecutor:
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
         )
-        if new_dp_size < old_dp_size:
-            self.stage_standby_moe_quant_methods()
+        self.stage_standby_moe_quant_methods()
+        if new_dp_size > old_dp_size:
+            self.transfer_weights(old_dp_size, new_dp_size)
 
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
