@@ -318,12 +318,35 @@ class ElasticEPScalingExecutor:
         dp_group = get_standby_dp_group() if standby else get_dp_group()
         ep_group = get_standby_ep_group() if standby else get_ep_group()
         assert dp_group is not None and ep_group is not None
+        role = "existing" if standby else "new"
         stream = torch.Stream(device=dp_group.device)
         with stream:
             tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
-            for group in (dp_group, ep_group):
+            for name, group in (("dp", dp_group), ("ep", ep_group)):
+                logger.info(
+                    "[EEP target diag] %s rank %d: %s all-reduce start",
+                    role,
+                    dp_group.rank,
+                    name,
+                )
                 torch.distributed.all_reduce(tensor, group=group.device_group)
+                logger.info(
+                    "[EEP target diag] %s rank %d: %s all-reduce enqueued",
+                    role,
+                    dp_group.rank,
+                    name,
+                )
+        logger.info(
+            "[EEP target diag] %s rank %d: stream sync start",
+            role,
+            dp_group.rank,
+        )
         stream.synchronize()
+        logger.info(
+            "[EEP target diag] %s rank %d: stream sync complete",
+            role,
+            dp_group.rank,
+        )
 
         parallel_config = self.worker.vllm_config.parallel_config
         if parallel_config.eplb_config.communicator != "nixl":
@@ -350,7 +373,17 @@ class ElasticEPScalingExecutor:
             expert_buffer=expert_buffer,
         )
         assert isinstance(communicator, NixlEplbCommunicator)
+        logger.info(
+            "[EEP target diag] %s rank %d: NIXL init start",
+            role,
+            dp_group.rank,
+        )
         communicator.initialize()
+        logger.info(
+            "[EEP target diag] %s rank %d: NIXL init complete",
+            role,
+            dp_group.rank,
+        )
         self._prepared_eplb = communicator, prepared_buffer
 
     def broadcast_expert_mapping(self) -> None:
