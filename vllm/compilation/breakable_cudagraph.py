@@ -44,6 +44,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.utils.gc_utils import time_gc_operation
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -372,7 +373,7 @@ class BreakableCUDAGraphWrapper:
         # session may issue many begin/end pairs (one per layer's break),
         # and repeated gc would tank capture time the way it did for the
         # pre-`gc_disable` piecewise path.
-        gc.collect()
+        time_gc_operation("breakable_capture.collect", gc.collect)
         torch.accelerator.empty_cache()
         # Sync the offloader's copy stream before capture so any in-flight
         # pre-capture prefetches are complete and don't leak into the graph.

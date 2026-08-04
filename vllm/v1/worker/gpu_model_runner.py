@@ -120,6 +120,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.gc_utils import time_gc_operation
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.nvtx_pytorch_hooks import PytHooks
@@ -6495,7 +6496,7 @@ class GPUModelRunner(
         self._sync_device()
         del hidden_states, output
         self.encoder_cache.clear()
-        gc.collect()
+        time_gc_operation("profile_run.collect", gc.collect)
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
@@ -6528,16 +6529,16 @@ class GPUModelRunner(
     @staticmethod
     @contextmanager
     def _freeze_gc():
-        gc.collect()
+        time_gc_operation("capture.enter.collect", gc.collect)
         should_freeze = not envs.VLLM_ENABLE_CUDAGRAPH_GC
         if should_freeze:
-            gc.freeze()
+            time_gc_operation("capture.enter.freeze", gc.freeze)
         try:
             yield
         finally:
             if should_freeze:
-                gc.unfreeze()
-                gc.collect()
+                time_gc_operation("capture.exit.unfreeze", gc.unfreeze)
+                time_gc_operation("capture.exit.collect", gc.collect)
 
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
@@ -6559,7 +6560,7 @@ class GPUModelRunner(
 
         reset_workspace_manager()
         if current_platform.is_rocm() or current_platform.is_xpu():
-            gc.collect()
+            time_gc_operation("shutdown.collect", gc.collect)
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
 
@@ -6592,7 +6593,7 @@ class GPUModelRunner(
                 if hasattr(layer.impl, "_v_scale_cache"):
                     layer.impl._v_scale_cache = None
 
-        gc.collect()
+        time_gc_operation("profiling_kv_cache_cleanup.collect", gc.collect)
         torch.accelerator.empty_cache()
 
         logger.debug("Cleaned up profiling KV cache and CUDA graphs")

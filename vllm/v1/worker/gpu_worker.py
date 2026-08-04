@@ -59,7 +59,11 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
-from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
+from vllm.utils.gc_utils import (
+    freeze_gc_heap,
+    maybe_attach_gc_debug_callback,
+    time_gc_operation,
+)
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
@@ -388,7 +392,7 @@ class Worker(WorkerBase):
             set_random_seed(self.model_config.seed)
 
             # Now take memory snapshot after NCCL is initialized
-            gc.collect()
+            time_gc_operation("worker.init_memory_snapshot.collect", gc.collect)
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
@@ -1313,7 +1317,7 @@ class Worker(WorkerBase):
             self._weight_update_active = False
 
     def shutdown(self) -> None:
-        gc.unfreeze()
+        time_gc_operation("worker.shutdown.unfreeze", gc.unfreeze)
 
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

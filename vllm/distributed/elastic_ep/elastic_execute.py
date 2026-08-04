@@ -46,6 +46,7 @@ from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
 )
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.utils import is_moe_layer
+from vllm.utils.gc_utils import time_gc_operation
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
@@ -398,7 +399,7 @@ class ElasticEPScalingExecutor:
         with set_current_vllm_config(self.worker.vllm_config):
             reset_compile_wrapper(self.worker.model_runner.get_model())
 
-        gc.collect()
+        time_gc_operation("eep.release_cuda_graphs.collect", gc.collect)
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
 

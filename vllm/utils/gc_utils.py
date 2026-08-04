@@ -4,6 +4,7 @@ import gc
 import json
 import time
 from collections import Counter
+from collections.abc import Callable
 from contextlib import suppress
 from typing import Any
 
@@ -11,6 +12,21 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def time_gc_operation(name: str, operation: Callable[..., Any], *args: Any) -> Any:
+    freeze_count = gc.get_freeze_count()
+    start = time.perf_counter()
+    result = operation(*args)
+    logger.info(
+        "[GC timing] %s took %.6f seconds (result=%s, freeze_count=%d->%d)",
+        name,
+        time.perf_counter() - start,
+        result,
+        freeze_count,
+        gc.get_freeze_count(),
+    )
+    return result
 
 
 class GCDebugConfig:
@@ -101,11 +117,11 @@ def freeze_gc_heap() -> None:
     """
     # Ensure all static objects are pushed down to the oldest generation for
     # freeze
-    gc.collect(0)
-    gc.collect(1)
-    gc.collect(2)
+    time_gc_operation("freeze_heap.collect_0", gc.collect, 0)
+    time_gc_operation("freeze_heap.collect_1", gc.collect, 1)
+    time_gc_operation("freeze_heap.collect_2", gc.collect, 2)
     # Freeze all GC tracked objects
-    gc.freeze()
+    time_gc_operation("freeze_heap.freeze", gc.freeze)
 
 
 def maybe_attach_gc_debug_callback() -> None:
