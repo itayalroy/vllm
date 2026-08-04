@@ -176,6 +176,8 @@ class ElasticEPScalingExecutor:
         self._cuda_allocator_snapshots: dict[
             int, Counter[tuple[tuple[int, int], str, int]]
         ] = {}
+        self._cuda_allocator_addresses: dict[int, set[int]] = {}
+        self._cuda_memory_history_enabled = False
 
     @property
     def worker(self):
@@ -409,6 +411,15 @@ class ElasticEPScalingExecutor:
     def _release_cuda_graphs(self) -> None:
         self._graph_release_index += 1
         release_index = self._graph_release_index
+        parallel_config = self.worker.vllm_config.parallel_config
+        if (
+            parallel_config.data_parallel_rank == 0
+            and not self._cuda_memory_history_enabled
+        ):
+            torch.__dict__["cuda"].memory._record_memory_history(
+                enabled="state", context="state", stacks="python"
+            )
+            self._cuda_memory_history_enabled = True
         torch.accelerator.synchronize()
         self._log_cuda_memory(release_index, "before")
 
@@ -477,24 +488,32 @@ class ElasticEPScalingExecutor:
             return
 
         blocks: Counter[tuple[tuple[int, int], str, int]] = Counter()
-        segments = torch.__dict__["cuda"].memory_snapshot(include_traces=False)
+        segments = torch.__dict__["cuda"].memory_snapshot()
+        block_sites = []
         for segment in segments:
             pool_id = segment.get("segment_pool_id", (0, 0))
             for block in segment["blocks"]:
                 if block["state"].startswith("active"):
-                    blocks[(pool_id, block["state"], block["size"])] += 1
+                    key = (pool_id, block["state"], block["size"])
+                    blocks[key] += 1
+                    block_sites.append((block["address"], key, block["frames"]))
 
         dp_size = parallel_config.data_parallel_size
         previous = self._cuda_allocator_snapshots.get(dp_size)
+        previous_addresses = self._cuda_allocator_addresses.get(dp_size)
         self._cuda_allocator_snapshots[dp_size] = blocks
-        if previous is None:
+        self._cuda_allocator_addresses[dp_size] = {
+            address for address, _, _ in block_sites
+        }
+        if previous is None or previous_addresses is None:
             return
 
         added = blocks - previous
         removed = previous - blocks
+        added_keys = set(added)
         logger.info(
             "[Elastic EP GC diagnostic] dp_size=%d allocator_delta_mib=%.3f "
-            "added=%s removed=%s",
+            "added=%s removed=%s allocation_sites=%s",
             dp_size,
             (
                 sum(size * count for (_, _, size), count in added.items())
@@ -503,6 +522,17 @@ class ElasticEPScalingExecutor:
             / 2**20,
             added.most_common(12),
             removed.most_common(12),
+            [
+                (
+                    key[2],
+                    [
+                        f"{frame['filename']}:{frame['line']}:{frame['name']}"
+                        for frame in frames[:12]
+                    ],
+                )
+                for address, key, frames in block_sites
+                if address not in previous_addresses and key in added_keys
+            ],
         )
 
     def _log_retired_eplb(self) -> None:
