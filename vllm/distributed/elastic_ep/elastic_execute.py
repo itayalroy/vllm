@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import weakref
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -155,6 +158,24 @@ class ElasticEPScalingExecutor:
         )
         self._async_future: Future[None] | None = None
         self._group_cleanup_future: Future[None] | None = None
+        self._graph_release_index = 0
+        self._retired_graph_refs: list[
+            tuple[
+                int,
+                list[weakref.ReferenceType[object]],
+                list[weakref.ReferenceType[object]],
+            ]
+        ] = []
+        self._retired_eplb_refs: list[
+            tuple[
+                int,
+                weakref.ReferenceType[object],
+                list[weakref.ReferenceType[torch.Tensor]],
+            ]
+        ] = []
+        self._cuda_allocator_snapshots: dict[
+            int, Counter[tuple[tuple[int, int], str, int]]
+        ] = {}
 
     @property
     def worker(self):
@@ -386,6 +407,20 @@ class ElasticEPScalingExecutor:
         self._staged_moe_quant_methods.clear()
 
     def _release_cuda_graphs(self) -> None:
+        self._graph_release_index += 1
+        release_index = self._graph_release_index
+        torch.accelerator.synchronize()
+        self._log_cuda_memory(release_index, "before")
+
+        entry_refs: list[weakref.ReferenceType[object]] = []
+        graph_refs: list[weakref.ReferenceType[object]] = []
+        for wrapper in list(CUDAGraphWrapper._all_instances):
+            for entry in wrapper.concrete_cudagraph_entries.values():
+                entry_refs.append(weakref.ref(entry))
+                if entry.cudagraph is not None:
+                    with suppress(TypeError):
+                        graph_refs.append(weakref.ref(entry.cudagraph))
+
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
             CUDAGraphWrapper.clear_all_graphs()
 
@@ -398,6 +433,97 @@ class ElasticEPScalingExecutor:
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+        self._retired_graph_refs.append((release_index, entry_refs, graph_refs))
+        self._log_retired_graphs()
+        self._log_cuda_memory(release_index, "after")
+        self._log_cuda_allocator_snapshot(release_index)
+        self._log_retired_eplb()
+
+    def _log_cuda_memory(self, release_index: int, phase: str) -> None:
+        free_memory, _ = torch.accelerator.get_memory_info()
+        logger.info(
+            "[Elastic EP GC diagnostic] release=%d phase=%s "
+            "allocated_gib=%.3f reserved_gib=%.3f free_gib=%.3f",
+            release_index,
+            phase,
+            torch.accelerator.memory_allocated() / 2**30,
+            torch.accelerator.memory_reserved() / 2**30,
+            free_memory / 2**30,
+        )
+
+    def _log_retired_graphs(self) -> None:
+        alive = []
+        first_survivor = None
+        for release_index, entry_refs, graph_refs in self._retired_graph_refs:
+            alive_entries = [ref for ref in entry_refs if ref() is not None]
+            alive_graphs = [ref for ref in graph_refs if ref() is not None]
+            alive.append((release_index, len(alive_entries), len(alive_graphs)))
+            first_survivor = first_survivor or next(
+                iter(alive_entries or alive_graphs), None
+            )
+        logger.info("[Elastic EP GC diagnostic] retired_alive=%s", alive)
+        if first_survivor is not None and (obj := first_survivor()) is not None:
+            logger.info(
+                "[Elastic EP GC diagnostic] survivor_type=%s tracked=%s "
+                "referrer_types=%s",
+                type(obj).__qualname__,
+                gc.is_tracked(obj),
+                sorted({type(ref).__qualname__ for ref in gc.get_referrers(obj)}),
+            )
+
+    def _log_cuda_allocator_snapshot(self, release_index: int) -> None:
+        parallel_config = self.worker.vllm_config.parallel_config
+        if parallel_config.data_parallel_rank != 0 or release_index % 2:
+            return
+
+        blocks: Counter[tuple[tuple[int, int], str, int]] = Counter()
+        segments = torch.__dict__["cuda"].memory_snapshot(include_traces=False)
+        for segment in segments:
+            pool_id = segment.get("segment_pool_id", (0, 0))
+            for block in segment["blocks"]:
+                if block["state"].startswith("active"):
+                    blocks[(pool_id, block["state"], block["size"])] += 1
+
+        dp_size = parallel_config.data_parallel_size
+        previous = self._cuda_allocator_snapshots.get(dp_size)
+        self._cuda_allocator_snapshots[dp_size] = blocks
+        if previous is None:
+            return
+
+        added = blocks - previous
+        removed = previous - blocks
+        logger.info(
+            "[Elastic EP GC diagnostic] dp_size=%d allocator_delta_mib=%.3f "
+            "added=%s removed=%s",
+            dp_size,
+            (
+                sum(size * count for (_, _, size), count in added.items())
+                - sum(size * count for (_, _, size), count in removed.items())
+            )
+            / 2**20,
+            added.most_common(12),
+            removed.most_common(12),
+        )
+
+    def _log_retired_eplb(self) -> None:
+        if not self._retired_eplb_refs:
+            return
+        logger.info(
+            "[Elastic EP GC diagnostic] retired_eplb=%s",
+            [
+                (
+                    release,
+                    communicator() is not None,
+                    sum(
+                        tensor.nbytes
+                        for ref in buffers
+                        if (tensor := ref()) is not None
+                    )
+                    / 2**20,
+                )
+                for release, communicator, buffers in self._retired_eplb_refs
+            ],
+        )
 
     def switch_and_remove(self) -> None:
         self._wait_for_group_cleanup()
@@ -530,6 +656,13 @@ class ElasticEPScalingExecutor:
                     module._replace_quant_method(module._quant_method.old_quant_method)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
 
+        self._retired_eplb_refs.append(
+            (
+                self._graph_release_index,
+                weakref.ref(eplb_model_state.communicator),
+                [weakref.ref(tensor) for tensor in eplb_model_state.expert_buffer],
+            )
+        )
         eplb_model_state.expert_buffer = [
             torch.empty_like(w) for w in model.expert_weights[0]
         ]
@@ -542,6 +675,7 @@ class ElasticEPScalingExecutor:
             expert_weights=model.expert_weights,
             expert_buffer=eplb_model_state.expert_buffer,
         )
+        self._log_retired_eplb()
 
         if (
             self.worker.vllm_config.compilation_config.mode
