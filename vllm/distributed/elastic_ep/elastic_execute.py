@@ -336,17 +336,13 @@ class ElasticEPScalingExecutor:
                     dp_group.rank,
                     name,
                 )
-        logger.info(
-            "[EEP target diag] %s rank %d: stream sync start",
-            role,
-            dp_group.rank,
-        )
-        stream.synchronize()
-        logger.info(
-            "[EEP target diag] %s rank %d: stream sync complete",
-            role,
-            dp_group.rank,
-        )
+                stream.synchronize()
+                logger.info(
+                    "[EEP target diag] %s rank %d: %s all-reduce complete",
+                    role,
+                    dp_group.rank,
+                    name,
+                )
 
         parallel_config = self.worker.vllm_config.parallel_config
         if parallel_config.eplb_config.communicator != "nixl":
