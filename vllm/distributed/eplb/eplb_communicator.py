@@ -10,6 +10,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import Any
 
 import numpy as np
 import torch
@@ -246,7 +247,7 @@ class NixlEplbCommunicator(EplbCommunicator):
         cpu_group: ProcessGroup,
         all_expert_weights: Sequence[Sequence[torch.Tensor]],
         expert_buffer: Sequence[torch.Tensor],
-        defer_remote_setup: bool = False,
+        defer_init: bool = False,
     ) -> None:
         """Create a NIXL-backed EPLB communicator.
 
@@ -254,11 +255,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             cpu_group: CPU process group for metadata exchange.
             all_expert_weights: Expert weight tensors for all MoE layers.
             expert_buffer: Pre-allocated receive buffer tensors.
-            defer_remote_setup: If True, postpone the collective
-                all-gather of NIXL agent metadata until the first
-                ``set_transfer_context`` call.  Required for elastic EP
-                where ranks join asynchronously and cannot participate
-                in collectives at construction time.
+            defer_init: If True, postpone NIXL initialization until
+                the first ``set_transfer_context`` call. Required for elastic
+                EP where ranks join asynchronously.
         """
         assert all_expert_weights, (
             "NixlEplbCommunicator requires non-empty all_expert_weights."
@@ -304,7 +303,9 @@ class NixlEplbCommunicator(EplbCommunicator):
             if nixl_agent_config is not None
             else None
         )
-        self._nixl_wrapper = nixl_wrapper_cls(self._make_agent_name(), config)
+        self._nixl_wrapper_cls = nixl_wrapper_cls
+        self._nixl_agent_config = config
+        self._nixl_wrapper: Any = None
         self._nixl_memory_type = "VRAM"
         # NIXL registration handles; deregistered in __del__.
         self._registered_descs: list[object] = []
@@ -316,12 +317,18 @@ class NixlEplbCommunicator(EplbCommunicator):
 
         self._cuda_device_id = int(self._device.index or 0)
         self._remote_state_initialized = False
-        self._init_step("buffers", self._init_registered_buffers)
-        if defer_remote_setup:
-            logger.info_once("NIXL EPLB: deferring remote agent setup (elastic EP).")
+        if defer_init:
+            logger.info_once("NIXL EPLB: deferring initialization (elastic EP).")
         else:
             self._init_remote_state()
-        self._log_initialized()
+
+    def _init_local_state(self) -> None:
+        if self._nixl_wrapper is not None:
+            return
+        self._nixl_wrapper = self._nixl_wrapper_cls(
+            self._make_agent_name(), self._nixl_agent_config
+        )
+        self._init_step("buffers", self._init_registered_buffers)
 
     def _init_remote_state(self) -> None:
         """Exchange NIXL agent metadata and RDMA pointer info with all peers.
@@ -334,10 +341,14 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._init_step("agents", self._init_remote_agents)
         self._init_step("send meta", self._exchange_remote_send_meta)
         self._remote_state_initialized = True
+        self._log_initialized()
 
     def _ensure_remote_state(self) -> None:
         if not self._remote_state_initialized:
             self._init_remote_state()
+
+    def initialize(self) -> None:
+        self._ensure_remote_state()
 
     @property
     def needs_profile_buffer_reservation(self) -> bool:
@@ -431,11 +442,19 @@ class NixlEplbCommunicator(EplbCommunicator):
         self._xfer_entries.append((local_h, remote_h, xfer_h))
 
     def _init_remote_agents(self) -> None:
-        local_metadata = self._nixl_wrapper.get_agent_metadata()
+        error: Exception | None = None
+        try:
+            self._init_local_state()
+            local_metadata = self._nixl_wrapper.get_agent_metadata()
+        except Exception as exc:
+            error = exc
+            local_metadata = None
         gathered_metadata: list[bytes | None] = [None] * self._world_size
         torch.distributed.all_gather_object(
             gathered_metadata, local_metadata, group=self._cpu_group
         )
+        if any(metadata is None for metadata in gathered_metadata):
+            raise RuntimeError("NIXL EPLB initialization failed") from error
         for peer in range(self._world_size):
             if peer == self._rank:
                 continue
@@ -671,8 +690,8 @@ def create_eplb_communicator(
             Falls back to ``"torch_nccl"`` when *None*.
             Stateless (elastic EP) groups support ``"torch_nccl"``,
             ``"pynccl"``, and ``"nixl"``; ``"torch_nccl"`` is silently
-            promoted to ``"pynccl"``.  ``"nixl"`` uses deferred remote
-            agent setup to avoid collective deadlocks during elastic
+            promoted to ``"pynccl"``.  ``"nixl"`` uses deferred
+            initialization to avoid collective deadlocks during elastic
             scaling.  When tensors reside on CPU, ``"torch_gloo"`` or
             ``"torch_nccl"`` are used via the CPU process group.
         expert_weights: Expert weight tensors for *all* MoE layers.
@@ -729,7 +748,7 @@ def create_eplb_communicator(
     is_stateless = isinstance(group_coordinator, StatelessGroupCoordinator)
     if is_stateless:
         if backend == "nixl":
-            pass  # handled below with defer_remote_setup=True
+            pass  # handled below with defer_init=True
         elif backend not in ("torch_nccl", "pynccl"):
             raise ValueError(
                 f"Elastic EP requires 'torch_nccl', 'pynccl', or 'nixl' "
@@ -759,7 +778,7 @@ def create_eplb_communicator(
                 cpu_group=group_coordinator.cpu_group,
                 all_expert_weights=expert_weights,
                 expert_buffer=expert_buffer,
-                defer_remote_setup=is_stateless,
+                defer_init=is_stateless,
             )
         except Exception as exc:
             raise RuntimeError(

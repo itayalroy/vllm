@@ -353,6 +353,8 @@ class EplbState:
         self,
         model: MixtureOfExperts,
         model_config: ModelConfig,
+        expert_buffer: list[torch.Tensor] | None = None,
+        communicator: EplbCommunicator | None = None,
     ):
         """
         Build the initial EPLB state.
@@ -462,17 +464,19 @@ class EplbState:
             logical_replica_count,
         )
         self._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
-        expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
-
-        assert self.parallel_config.eplb_config.communicator is not None, (
-            "EPLB communicator backend must be set by ParallelConfig"
-        )
-        communicator = create_eplb_communicator(
-            group_coordinator=get_eplb_group(),
-            backend=self.parallel_config.eplb_config.communicator,
-            expert_weights=model.expert_weights,
-            expert_buffer=expert_buffer,
-        )
+        assert (expert_buffer is None) == (communicator is None)
+        if expert_buffer is None:
+            expert_buffer = [torch.empty_like(w) for w in model.expert_weights[0]]
+            assert self.parallel_config.eplb_config.communicator is not None, (
+                "EPLB communicator backend must be set by ParallelConfig"
+            )
+            communicator = create_eplb_communicator(
+                group_coordinator=get_eplb_group(),
+                backend=self.parallel_config.eplb_config.communicator,
+                expert_weights=model.expert_weights,
+                expert_buffer=expert_buffer,
+            )
+        assert communicator is not None
 
         model_state = EplbModelState(
             physical_to_logical_map=physical_to_logical_map,
@@ -982,23 +986,30 @@ class EplbState:
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
         parallel_state = get_ep_group()
         has_result = int(model_state.pending_result is not None)
+        worker_failed = (
+            self.async_worker is not None and not self.async_worker.is_alive()
+        )
 
         cpu_group = getattr(parallel_state, "cpu_group", None)
         if cpu_group is not None and cpu_group.size() > 1:
-            flag = torch.tensor((has_result,), dtype=torch.int32, device="cpu")
-            all_reduce(flag, group=cpu_group)
-            return int(flag.item()) == cpu_group.size()
+            group, device = cpu_group, "cpu"
+        else:
+            group = parallel_state.device_group
+            if group.size() <= 1:
+                if worker_failed:
+                    raise RuntimeError("Async EPLB worker failed")
+                return bool(has_result)
+            device = getattr(
+                parallel_state, "device", model_state.physical_to_logical_map.device
+            )
 
-        device_group = parallel_state.device_group
-        if device_group.size() <= 1:
-            return bool(has_result)
-
-        device = getattr(
-            parallel_state, "device", model_state.physical_to_logical_map.device
+        status = torch.tensor(
+            (has_result, int(worker_failed)), dtype=torch.int32, device=device
         )
-        flag = torch.tensor((has_result,), dtype=torch.int32, device=device)
-        all_reduce(flag, group=device_group)
-        return int(flag.item()) == device_group.size()
+        all_reduce(status, group=group)
+        if status[1].item():
+            raise RuntimeError("Async EPLB worker failed")
+        return int(status[0].item()) == group.size()
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """
@@ -1046,6 +1057,8 @@ class EplbState:
         parallel_config: ParallelConfig,
         expanded_physical_to_logical: torch.Tensor,
         num_valid_physical_experts: int,
+        expert_buffer: list[torch.Tensor] | None = None,
+        communicator: EplbCommunicator | None = None,
     ) -> "EplbState":
         eplb_state = cls(
             parallel_config=parallel_config,
@@ -1054,6 +1067,8 @@ class EplbState:
         eplb_state.add_model(
             model=model,
             model_config=model_config,
+            expert_buffer=expert_buffer,
+            communicator=communicator,
         )
         eplb_state.num_valid_physical_experts = num_valid_physical_experts
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
