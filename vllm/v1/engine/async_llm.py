@@ -1066,12 +1066,19 @@ class AsyncLLM(EngineClient):
             self.logger_manager.log_engine_initialized()
 
         set_scaling_elastic_ep(True)
+        gate_start = time.perf_counter()
         if envs.VLLM_ELASTIC_EP_DRAIN_REQUESTS:
             await self._drain_requests_for_elastic_ep(drain_timeout)
 
         await self.engine_core.commit_elastic_ep()
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         set_scaling_elastic_ep(False)
+        logger.info(
+            "[EEP_DIAG] admission_gate old_dp=%d new_dp=%d seconds=%.6f",
+            old_data_parallel_size,
+            new_data_parallel_size,
+            time.perf_counter() - gate_start,
+        )
 
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest

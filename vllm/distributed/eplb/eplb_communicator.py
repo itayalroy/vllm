@@ -338,10 +338,20 @@ class NixlEplbCommunicator(EplbCommunicator):
         ``set_transfer_context`` invocation, where all ranks are
         guaranteed to be synchronized.
         """
+        started = time.perf_counter()
         self._init_step("agents", self._init_remote_agents)
+        agents_ready = time.perf_counter()
         self._init_step("send meta", self._exchange_remote_send_meta)
         self._remote_state_initialized = True
         self._log_initialized()
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] nixl_remote_init rank=%d agents=%.6f metadata=%.6f total=%.6f",
+            self._rank,
+            agents_ready - started,
+            finished - agents_ready,
+            finished - started,
+        )
 
     def _ensure_remote_state(self) -> None:
         if not self._remote_state_initialized:
@@ -610,6 +620,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._layer_idx = None
 
     def __del__(self) -> None:
+        started = time.perf_counter()
         with contextlib.suppress(Exception):
             for local_h, remote_h, xfer_h in self._xfer_entries:
                 with contextlib.suppress(Exception):
@@ -628,6 +639,12 @@ class NixlEplbCommunicator(EplbCommunicator):
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.remove_remote_agent(agent_name)
             self._remote_agents.clear()
+        with contextlib.suppress(Exception):
+            logger.info(
+                "[EEP_DIAG] nixl_destroy rank=%d seconds=%.6f",
+                self._rank,
+                time.perf_counter() - started,
+            )
 
 
 class PyNcclEplbCommunicator(EplbCommunicator):

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -319,6 +320,7 @@ class ElasticEPScalingExecutor:
         parallel_config = self.worker.vllm_config.parallel_config
         if parallel_config.eplb_config.communicator != "nixl":
             return
+        started = time.perf_counter()
         assert eplb_group is not None
         model_runner = self.worker.model_runner
         model = model_runner.get_model()
@@ -347,6 +349,12 @@ class ElasticEPScalingExecutor:
         assert isinstance(communicator, NixlEplbCommunicator)
         communicator.initialize()
         self._prepared_eplb = expert_buffer, communicator
+        logger.info(
+            "[EEP_DIAG] prepare_eplb rank=%s reused_buffer=%s seconds=%.6f",
+            eplb_group.rank,
+            eplb_model_state is not None,
+            time.perf_counter() - started,
+        )
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
         assert dp_group is not None and ep_group is not None
@@ -427,18 +435,31 @@ class ElasticEPScalingExecutor:
         self._staged_moe_quant_methods.clear()
 
     def _release_cuda_graphs(self) -> None:
+        started = time.perf_counter()
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
             CUDAGraphWrapper.clear_all_graphs()
 
         elif isinstance(self.worker.model_runner.model, UBatchWrapper):
             raise RuntimeError("DBO is not yet supported in elastic EP")
+        graphs_cleared = time.perf_counter()
 
         torch.compiler.reset()
         with set_current_vllm_config(self.worker.vllm_config):
             reset_compile_wrapper(self.worker.model_runner.get_model())
+        compiler_reset = time.perf_counter()
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] release_cuda_graphs worker_rank=%s graphs=%.6f "
+            "compiler=%.6f cache=%.6f total=%.6f",
+            self.worker.rank,
+            graphs_cleared - started,
+            compiler_reset - graphs_cleared,
+            finished - compiler_reset,
+            finished - started,
+        )
 
     def switch_and_remove(self) -> None:
         self._wait_for_group_cleanup()
@@ -451,11 +472,14 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        started = time.perf_counter()
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs()
+        graphs_released = time.perf_counter()
         retired_groups = _replace_active_groups(**pop_standby_groups())
+        groups_replaced = time.perf_counter()
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -499,6 +523,7 @@ class ElasticEPScalingExecutor:
         for module in moe_modules:
             new_moe_config = self._make_eep_moe_config(module, dp_group, ep_group)
             module._set_moe_config(new_moe_config)
+        moe_configured = time.perf_counter()
 
         # Update EPLB state
         eplb_state = self.worker.model_runner.eplb_state
@@ -548,6 +573,7 @@ class ElasticEPScalingExecutor:
                 :, :, :num_physical_experts
             ]
             eplb_state.num_valid_physical_experts = num_physical_experts
+        eplb_resized = time.perf_counter()
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
@@ -570,6 +596,7 @@ class ElasticEPScalingExecutor:
                 if getattr(module._quant_method, "wraps_legacy_quant_method", False):
                     module._replace_quant_method(module._quant_method.old_quant_method)
             prepare_communication_buffer_for_model(self.worker.model_runner.model)
+        model_prepared = time.perf_counter()
 
         if self._prepared_eplb is not None:
             eplb_model_state.expert_buffer, eplb_model_state.communicator = (
@@ -589,6 +616,7 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
                 expert_buffer=eplb_model_state.expert_buffer,
             )
+        communicator_installed = time.perf_counter()
 
         if (
             self.worker.vllm_config.compilation_config.mode
@@ -605,6 +633,27 @@ class ElasticEPScalingExecutor:
             compilation_counter.stock_torch_compile_count += 1
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
 
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] switch_model_state worker_rank=%s config_moe=%.6f "
+            "resize_eplb=%.6f prepare_model=%.6f communicator=%.6f "
+            "compile=%.6f",
+            self.worker.rank,
+            moe_configured - groups_replaced,
+            eplb_resized - moe_configured,
+            model_prepared - eplb_resized,
+            communicator_installed - model_prepared,
+            finished - communicator_installed,
+        )
+        logger.info(
+            "[EEP_DIAG] switch_and_prepare worker_rank=%s release=%.6f "
+            "replace_groups=%.6f model_state=%.6f total=%.6f",
+            self.worker.rank,
+            graphs_released - started,
+            groups_replaced - graphs_released,
+            finished - groups_replaced,
+            finished - started,
+        )
         return retired_groups
 
     def _perform_eplb_reshuffle(
@@ -612,6 +661,7 @@ class ElasticEPScalingExecutor:
         rank_mapping: dict[int, int] | None = None,
         async_op: bool = False,
     ) -> None:
+        started = time.perf_counter()
         if get_ep_group().rank == 0:
             logger.info("[Elastic EP] Starting expert resharding...")
 
@@ -623,10 +673,12 @@ class ElasticEPScalingExecutor:
         is_async_enabled = eplb_state.is_async
         run_async = async_op and is_async_enabled
         eplb_state.is_async = run_async
+        rearrange_started = time.perf_counter()
         if rank_mapping is None:
             eplb_state.rearrange()
         else:
             eplb_state.rearrange(rank_mapping=rank_mapping)
+        rearranged = time.perf_counter()
         if not run_async:
             # NOTE(yongji): check whether we need to synchronize here
             torch.accelerator.synchronize()
@@ -641,6 +693,17 @@ class ElasticEPScalingExecutor:
         # in setup_eplb_from_mapping() but don't start the thread there because
         # groups aren't ready yet.
         eplb_state.start_async_loop()
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] schedule_eplb rank=%s async=%s setup=%.6f "
+            "rearrange=%.6f start_loop=%.6f total=%.6f",
+            get_ep_group().rank,
+            run_async,
+            rearrange_started - started,
+            rearranged - rearrange_started,
+            finished - rearranged,
+            finished - started,
+        )
         if get_ep_group().rank == 0:
             logger.info(
                 "[Elastic EP] Expert resharding %s",
@@ -648,6 +711,7 @@ class ElasticEPScalingExecutor:
             )
 
     def commit_scale_up(self, is_existing_worker: bool) -> None:
+        started = time.perf_counter()
         if is_existing_worker:
             self.broadcast_expert_mapping()
             retired_groups = self.switch_and_prepare()
@@ -658,16 +722,40 @@ class ElasticEPScalingExecutor:
                 mapping, num_valid_experts, expert_buffer, communicator
             )
             self._prepared_eplb = None
+        setup_finished = time.perf_counter()
         eplb_state = self.worker.model_runner.eplb_state
         assert eplb_state is not None
         if eplb_state.is_async:
+            warm_started = time.perf_counter()
             self.warm_and_capture()
+            warm_finished = time.perf_counter()
             self._perform_eplb_reshuffle(async_op=True)
+            reshuffle_finished = time.perf_counter()
         else:
+            reshuffle_started = time.perf_counter()
             self._perform_eplb_reshuffle()
+            reshuffle_finished = time.perf_counter()
+            warm_started = reshuffle_finished
             self.warm_and_capture()
+            warm_finished = time.perf_counter()
         if is_existing_worker:
             self._start_group_cleanup(retired_groups)
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] commit_scale_up rank=%s existing=%s setup=%.6f "
+            "warm=%.6f reshuffle=%.6f cleanup=%.6f total=%.6f",
+            get_ep_group().rank,
+            is_existing_worker,
+            setup_finished - started,
+            warm_finished - warm_started,
+            (
+                reshuffle_finished - warm_finished
+                if eplb_state.is_async
+                else reshuffle_finished - reshuffle_started
+            ),
+            finished - max(warm_finished, reshuffle_finished),
+            finished - started,
+        )
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)
@@ -775,6 +863,7 @@ class ElasticEPScalingExecutor:
             kernel_warmup(self.worker, process_local_only=True)
 
     def warm_and_capture(self) -> None:
+        started = time.perf_counter()
         # Must run on every DP sibling in lockstep: _dummy_run calls
         # coordinate_batch_across_dp whenever data_parallel_size > 1
         # (gpu_model_runner.py:3663), which deadlocks if any rank skips it.
@@ -788,12 +877,14 @@ class ElasticEPScalingExecutor:
                 (bt.block_table.gpu.clone(), bt.block_table.cpu.clone())
             )
         multi_block_table.clear()
+        tables_saved = time.perf_counter()
 
         # _ensure_workspace_size allocates a fresh tensor on grow, leaving
         # any captured CUDA graph with a stale data pointer; drop graphs
         # before re-warm so captures realign with the resized buffer.
         self._release_cuda_graphs()
         unlock_workspace()
+        workspace_unlocked = time.perf_counter()
 
         # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
         # alone only exercises cudagraph-capture sizes and can leave the
@@ -802,12 +893,29 @@ class ElasticEPScalingExecutor:
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+        dummy_finished = time.perf_counter()
         self.worker.compile_or_warm_up_model()
+        compile_finished = time.perf_counter()
 
         lock_workspace()
+        workspace_locked = time.perf_counter()
 
         for bt, (saved_gpu, saved_cpu) in zip(
             multi_block_table.block_tables, saved_block_tables
         ):
             bt.block_table.gpu.copy_(saved_gpu)
             bt.block_table.cpu.copy_(saved_cpu)
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] warm_and_capture worker_rank=%s save_tables=%.6f "
+            "release_unlock=%.6f dummy=%.6f compile_capture=%.6f "
+            "lock=%.6f restore=%.6f total=%.6f",
+            self.worker.rank,
+            tables_saved - started,
+            workspace_unlocked - tables_saved,
+            dummy_finished - workspace_unlocked,
+            compile_finished - dummy_finished,
+            workspace_locked - compile_finished,
+            finished - workspace_locked,
+            finished - started,
+        )

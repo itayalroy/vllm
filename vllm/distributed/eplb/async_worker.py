@@ -5,6 +5,7 @@ The async worker that transfers experts in the background.
 """
 
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -80,6 +81,7 @@ def transfer_run_periodically(
 ) -> None:
     while True:
         state.rearrange_event.wait(stream=cuda_stream)
+        cycle_started = time.perf_counter()
 
         eplb_group = get_eplb_group().device_group
         eplb_cpu_group = get_eplb_group().cpu_group
@@ -100,6 +102,7 @@ def transfer_run_periodically(
             new_physical_to_logical_map = run_rebalance_experts(
                 model_state, state, physical_to_logical_map_cpu, cuda_stream
             )
+            mapping_ready = time.perf_counter()
 
             # Execute one EPLB layer transfer per model forward pass. Each iteration
             # of this loop will copy the new set of expert weights into
@@ -126,6 +129,7 @@ def transfer_run_periodically(
                     model_state.rebalanced = False
                     break
 
+                transfer_started = time.perf_counter()
                 transfer_metadata = transfer_layer(
                     old_layer_indices=physical_to_logical_map_cpu[layer_idx],
                     new_layer_indices=new_physical_to_logical_map[layer_idx],
@@ -137,10 +141,22 @@ def transfer_run_periodically(
                     cuda_stream=cuda_stream,
                     layer_idx=layer_idx,
                 )
+                transfer_returned = time.perf_counter()
 
                 # Wait until all writes to expert_buffer have finished before making the
                 # AsyncEplbLayerResult visible to the main thread.
                 cuda_stream.synchronize()
+                transfer_finished = time.perf_counter()
+                if layer_idx == 0:
+                    logger.info(
+                        "[EEP_DIAG] first_eplb_layer rank=%d mapping=%.6f "
+                        "transfer=%.6f stream_sync=%.6f since_wake=%.6f",
+                        ep_rank,
+                        mapping_ready - cycle_started,
+                        transfer_returned - transfer_started,
+                        transfer_finished - transfer_returned,
+                        transfer_finished - cycle_started,
+                    )
 
                 # This event guarantees that expert_buffer will not be overwritten by
                 # subsequent iterations of this loop until the main thread has consumed
@@ -160,3 +176,10 @@ def transfer_run_periodically(
                 consumed_event.wait(stream=cuda_stream)
                 assert model_state.pending_result is None
                 layer_idx += 1
+
+            logger.info(
+                "[EEP_DIAG] eplb_cycle rank=%d layers=%d seconds=%.6f",
+                ep_rank,
+                layer_idx,
+                time.perf_counter() - cycle_started,
+            )
