@@ -40,6 +40,7 @@ from vllm.config.cache import CacheConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -3445,6 +3446,8 @@ class GPUModelRunner(
         self,
         expanded_physical_to_logical: torch.Tensor,
         old_num_physical_experts: int,
+        expert_buffer: list[torch.Tensor] | None = None,
+        communicator: EplbCommunicator | None = None,
     ) -> None:
         assert self._moe_model is not None
 
@@ -3455,6 +3458,8 @@ class GPUModelRunner(
             parallel_config=self.parallel_config,
             expanded_physical_to_logical=expanded_physical_to_logical,
             num_valid_physical_experts=old_num_physical_experts,
+            expert_buffer=expert_buffer,
+            communicator=communicator,
         )
 
     def _pool(

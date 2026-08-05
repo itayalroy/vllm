@@ -339,6 +339,9 @@ class NixlEplbCommunicator(EplbCommunicator):
         if not self._remote_state_initialized:
             self._init_remote_state()
 
+    def initialize(self) -> None:
+        self._ensure_remote_state()
+
     @property
     def needs_profile_buffer_reservation(self) -> bool:
         return False
