@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -1752,12 +1753,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info("[Elastic EP] Successfully started new engines")
 
     async def _commit_scale_up_elastic_ep(self, new_data_parallel_size: int) -> None:
+        started = time.perf_counter()
         new_core_engines = [
             rank.to_bytes(2, "little")
             for rank in range(len(self.core_engines), new_data_parallel_size)
         ]
 
         await self.pause_scheduler_async(mode="keep", clear_cache=False)
+        paused = time.perf_counter()
         wait_future = self._eep_wait_for_setup_switch_complete()
         finish_futures = [
             asyncio.create_task(
@@ -1767,8 +1770,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ]
         try:
             await asyncio.gather(*finish_futures)
+            requested = time.perf_counter()
             await wait_future
+            switched = time.perf_counter()
             self._wait_for_new_engine_ready(new_core_engines)
+            engines_ready = time.perf_counter()
         except Exception:
             wait_future.cancel()
             raise
@@ -1788,12 +1794,26 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             ("SCALE_ELASTIC_EP", new_data_parallel_size)
         )
         await self.first_req_send_socket.send(scale_up_marker)
+        published = time.perf_counter()
 
         logger.info(
             "[Elastic EP] Scale up completed, new data parallel size: %s",
             new_data_parallel_size,
         )
         await self.resume_scheduler_async()
+        resumed = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] core_client_scale_up pause=%.6f request=%.6f "
+            "switch_wait=%.6f engine_ready=%.6f publish=%.6f resume=%.6f "
+            "total=%.6f",
+            paused - started,
+            requested - paused,
+            switched - requested,
+            engines_ready - switched,
+            published - engines_ready,
+            resumed - published,
+            resumed - started,
+        )
 
     async def _prepare_scale_down_elastic_ep(self, new_data_parallel_size: int) -> None:
         self._setup_elastic_ep_reconfig_bootstrap()

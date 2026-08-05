@@ -980,6 +980,7 @@ class EplbState:
                 )
 
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
+        started = time.perf_counter()
         parallel_state = get_ep_group()
         has_result = int(model_state.pending_result is not None)
         worker_failed = (
@@ -994,7 +995,15 @@ class EplbState:
             if group.size() <= 1:
                 if worker_failed:
                     raise RuntimeError("Async EPLB worker failed")
-                return bool(has_result)
+                ready = bool(has_result)
+                result = model_state.pending_result
+                if ready and result is not None and result.layer_idx == 0:
+                    logger.info(
+                        "[EEP_DIAG] first_eplb_ready rank=%s seconds=%.6f",
+                        parallel_state.rank,
+                        time.perf_counter() - started,
+                    )
+                return ready
             device = getattr(
                 parallel_state, "device", model_state.physical_to_logical_map.device
             )
@@ -1005,7 +1014,15 @@ class EplbState:
         all_reduce(status, group=group)
         if status[1].item():
             raise RuntimeError("Async EPLB worker failed")
-        return int(status[0].item()) == group.size()
+        ready = int(status[0].item()) == group.size()
+        result = model_state.pending_result
+        if ready and result is not None and result.layer_idx == 0:
+            logger.info(
+                "[EEP_DIAG] first_eplb_ready rank=%s seconds=%.6f",
+                parallel_state.rank,
+                time.perf_counter() - started,
+            )
+        return ready
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
         """
@@ -1325,6 +1342,7 @@ def _move_to_workspace(
     model_state: EplbModelState,
     ep_rank: int,
 ) -> None:
+    started = time.perf_counter()
     result = model_state.pending_result
     assert result is not None
     move_from_buffer(
@@ -1334,6 +1352,7 @@ def _move_to_workspace(
         new_indices=result.new_physical_to_logical_map.numpy(),
         ep_rank=ep_rank,
     )
+    weights_enqueued = time.perf_counter()
 
     _commit_eplb_maps_for_layer(
         model_state,
@@ -1347,3 +1366,13 @@ def _move_to_workspace(
     # Reset pending_result before unblocking the async worker
     model_state.pending_result = None
     result.consumed_event.record()
+    if result.layer_idx == 0:
+        finished = time.perf_counter()
+        logger.info(
+            "[EEP_DIAG] first_eplb_install rank=%d enqueue_weights=%.6f "
+            "maps_and_signal=%.6f total=%.6f",
+            ep_rank,
+            weights_enqueued - started,
+            finished - weights_enqueued,
+            finished - started,
+        )
