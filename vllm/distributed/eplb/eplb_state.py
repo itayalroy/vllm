@@ -1055,12 +1055,27 @@ class EplbState:
             model=model,
             model_config=model_config,
         )
-        eplb_state.num_valid_physical_experts = num_valid_physical_experts
-        eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
+        eplb_state.update_mapping(
+            model_config,
+            expanded_physical_to_logical,
+            num_valid_physical_experts,
+        )
+
+        return eplb_state
+
+    def update_mapping(
+        self,
+        model_config: ModelConfig,
+        expanded_physical_to_logical: torch.Tensor,
+        num_valid_physical_experts: int,
+    ) -> None:
+        self.num_valid_physical_experts = num_valid_physical_experts
+        eplb_model_state = self.model_states[model_config.compute_hash()]
         eplb_model_state.physical_to_logical_map.copy_(expanded_physical_to_logical)
 
         (logical_to_physical_map_cpu, logical_replica_count_cpu) = compute_logical_maps(
-            expanded_physical_to_logical.cpu(), model.num_logical_experts
+            expanded_physical_to_logical.cpu(),
+            eplb_model_state.model.num_logical_experts,
         )
 
         max_num_replicas = eplb_model_state.logical_to_physical_map.shape[-1]
@@ -1072,13 +1087,18 @@ class EplbState:
                 max_num_replicas - num_replicas,
             ),
             value=-1,
-        ).to(device)
-        logical_replica_count = logical_replica_count_cpu.to(device)
+        ).to(self.device)
+        logical_replica_count = logical_replica_count_cpu.to(self.device)
 
         eplb_model_state.logical_to_physical_map.copy_(logical_to_physical_map)
         eplb_model_state.logical_replica_count.copy_(logical_replica_count)
 
-        return eplb_state
+    def update_communicator(
+        self,
+        model_config: ModelConfig,
+        communicator: EplbCommunicator,
+    ) -> None:
+        self.model_states[model_config.compute_hash()].communicator = communicator
 
 
 @dataclass
