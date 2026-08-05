@@ -38,8 +38,6 @@ from vllm.distributed.eplb.eplb_communicator import (
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     _replace_active_groups,
-    get_eplb_group,
-    prepare_communication_buffer_for_model,
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import init_logger
@@ -701,6 +699,7 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
+        self._warm_target_groups(get_dp_group(), get_ep_group())
 
     def receive_expert_mapping(self) -> tuple[torch.Tensor, int, int]:
         dp_group = get_dp_group()
