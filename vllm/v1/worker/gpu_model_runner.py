@@ -3454,15 +3454,11 @@ class GPUModelRunner(
         expanded_physical_to_logical: torch.Tensor,
         old_num_physical_experts: int,
     ) -> None:
-        assert self._moe_model is not None
-
-        self.eplb_state = EplbState.from_mapping(
-            model=self._moe_model,
-            model_config=self.model_config,
-            device=self.device,
-            parallel_config=self.parallel_config,
-            expanded_physical_to_logical=expanded_physical_to_logical,
-            num_valid_physical_experts=old_num_physical_experts,
+        assert self.eplb_state is not None
+        self.eplb_state.update_mapping(
+            self.model_config,
+            expanded_physical_to_logical,
+            old_num_physical_experts,
         )
 
     def _pool(
@@ -5362,11 +5358,7 @@ class GPUModelRunner(
                 if is_mixture_of_experts(moe_candidate):
                     self._moe_model = moe_candidate
 
-                if (
-                    self._moe_model is not None
-                    and self.parallel_config.enable_eplb
-                    and not load_dummy_weights
-                ):
+                if self._moe_model is not None and self.parallel_config.enable_eplb:
                     logger.info_once(
                         "EPLB is enabled for model %s.",
                         self.model_config.model,
