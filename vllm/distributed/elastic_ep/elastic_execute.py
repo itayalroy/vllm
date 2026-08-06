@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
@@ -438,11 +439,14 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
+        timer = StageTimer("worker.switch_and_prepare")
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
         self._release_cuda_graphs()
+        timer.mark("release_cuda_graphs")
         retired_groups = _replace_active_groups(**pop_standby_groups())
+        timer.mark("replace_active_groups")
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
@@ -469,6 +473,7 @@ class ElasticEPScalingExecutor:
         parallel_config.data_parallel_master_port = (
             reconfig_request.new_data_parallel_master_port
         )
+        timer.mark("update_parallel_config")
 
         # Reconfigure MoE modules with new EP size
         moe_modules = [
@@ -486,6 +491,7 @@ class ElasticEPScalingExecutor:
         for module in moe_modules:
             new_moe_config = self._make_eep_moe_config(module, dp_group, ep_group)
             module._set_moe_config(new_moe_config)
+        timer.mark("replace_moe_configs")
 
         # Update EPLB state
         eplb_state = self.worker.model_runner.eplb_state
@@ -535,6 +541,7 @@ class ElasticEPScalingExecutor:
                 :, :, :num_physical_experts
             ]
             eplb_state.num_valid_physical_experts = num_physical_experts
+        timer.mark("resize_eplb_tensors")
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
@@ -544,22 +551,28 @@ class ElasticEPScalingExecutor:
                 eplb_model_state.logical_to_physical_map,
                 eplb_model_state.logical_replica_count,
             )
+            timer.mark("set_eplb_state")
             eplb_state._propagate_shared_tensors(
                 model, eplb_model_state.num_unpadded_tokens_tensors
             )
+            timer.mark("propagate_eplb_tensors")
             model.update_physical_experts_metadata(
                 num_physical_experts=num_physical_experts,
                 num_local_physical_experts=num_local_experts,
             )
+            timer.mark("update_expert_metadata")
             self._commit_staged_moe_quant_methods()
+            timer.mark("install_staged_moe_kernels")
             # Legacy modular methods need to be recreated for the new EP size.
             for module in moe_modules:
                 if getattr(module._quant_method, "wraps_legacy_quant_method", False):
                     module._replace_quant_method(module._quant_method.old_quant_method)
+            timer.mark("reset_legacy_moe_kernels")
 
         assert self._prepared_eplb_communicator is not None
         eplb_state.update_communicator(model_config, self._prepared_eplb_communicator)
         self._prepared_eplb_communicator = None
+        timer.mark("install_eplb_communicator")
 
         if (
             self.worker.vllm_config.compilation_config.mode
@@ -575,6 +588,8 @@ class ElasticEPScalingExecutor:
             )
             compilation_counter.stock_torch_compile_count += 1
             self.worker.model_runner.model.compile(fullgraph=True, backend=backend)
+        timer.mark("stock_torch_compile")
+        timer.total()
 
         return retired_groups
 
@@ -620,30 +635,50 @@ class ElasticEPScalingExecutor:
 
     def commit_scale_up(self, is_existing_worker: bool) -> None:
         if is_existing_worker:
+            timer = StageTimer("worker.commit_scale_up.existing")
             self.broadcast_expert_mapping()
+            timer.mark("broadcast_mapping")
             retired_groups = self.switch_and_prepare()
+            timer.mark("switch_and_prepare")
         else:
+            timer = StageTimer("worker.commit_scale_up.new")
             mapping, _, num_valid_experts = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping, num_valid_experts)
+            timer.mark("receive_and_install_mapping")
         eplb_state = self.worker.model_runner.eplb_state
         assert eplb_state is not None
         if eplb_state.is_async:
             self.warm_and_capture()
+            timer.mark("warm_and_capture")
+            schedule_timer = StageTimer(
+                "worker.commit_scale_up.schedule_eplb", synchronize_gpu=False
+            )
             self._perform_eplb_reshuffle(async_op=True)
+            schedule_timer.mark("host_call", synchronize_gpu=False)
         else:
             self._perform_eplb_reshuffle()
+            timer.mark("sync_eplb_reshuffle")
             self.warm_and_capture()
+            timer.mark("warm_and_capture")
         if is_existing_worker:
             self._start_group_cleanup(retired_groups)
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
+        timer = StageTimer(
+            f"worker.commit_scale_down.{'removing' if removing else 'retained'}"
+        )
         self.perform_scale_down_eplb_reshuffle(new_dp_size)
+        timer.mark("sync_eplb_reshuffle")
         if removing:
             self.switch_and_remove()
+            timer.mark("switch_and_remove")
         else:
             retired_groups = self.switch_and_prepare()
+            timer.mark("switch_and_prepare")
             self.warm_and_capture()
+            timer.mark("warm_and_capture")
             self._start_group_cleanup(retired_groups)
+        timer.total()
 
     def perform_scale_down_eplb_reshuffle(self, new_dp_size: int) -> None:
         eplb_state = self.worker.model_runner.eplb_state
@@ -737,6 +772,7 @@ class ElasticEPScalingExecutor:
             kernel_warmup(self.worker, process_local_only=True)
 
     def warm_and_capture(self) -> None:
+        timer = StageTimer("worker.warm_and_capture")
         # Must run on every DP sibling in lockstep: _dummy_run calls
         # coordinate_batch_across_dp whenever data_parallel_size > 1
         # (gpu_model_runner.py:3663), which deadlocks if any rank skips it.
@@ -750,12 +786,14 @@ class ElasticEPScalingExecutor:
                 (bt.block_table.gpu.clone(), bt.block_table.cpu.clone())
             )
         multi_block_table.clear()
+        timer.mark("save_and_clear_block_tables")
 
         # _ensure_workspace_size allocates a fresh tensor on grow, leaving
         # any captured CUDA graph with a stale data pointer; drop graphs
         # before re-warm so captures realign with the resized buffer.
         self._release_cuda_graphs()
         unlock_workspace()
+        timer.mark("release_graphs_and_unlock_workspace")
 
         # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
         # alone only exercises cudagraph-capture sizes and can leave the
@@ -764,7 +802,9 @@ class ElasticEPScalingExecutor:
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+        timer.mark("max_token_dummy_forward")
         self.worker.compile_or_warm_up_model()
+        timer.mark("compile_and_capture")
 
         lock_workspace()
 
@@ -773,3 +813,5 @@ class ElasticEPScalingExecutor:
         ):
             bt.block_table.gpu.copy_(saved_gpu)
             bt.block_table.cpu.copy_(saved_cpu)
+        timer.mark("restore_block_tables")
+        timer.total()

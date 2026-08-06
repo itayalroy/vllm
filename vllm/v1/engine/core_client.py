@@ -23,6 +23,7 @@ import zmq.asyncio
 
 from vllm import envs
 from vllm.config import VllmConfig
+from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
 from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -1752,12 +1753,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         logger.info("[Elastic EP] Successfully started new engines")
 
     async def _commit_scale_up_elastic_ep(self, new_data_parallel_size: int) -> None:
+        timer = StageTimer("client.commit_scale_up", synchronize_gpu=False)
         new_core_engines = [
             rank.to_bytes(2, "little")
             for rank in range(len(self.core_engines), new_data_parallel_size)
         ]
 
         await self.pause_scheduler_async(mode="keep", clear_cache=False)
+        timer.mark("pause_schedulers")
         wait_future = self._eep_wait_for_setup_switch_complete()
         finish_futures = [
             asyncio.create_task(
@@ -1767,13 +1770,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         ]
         try:
             await asyncio.gather(*finish_futures)
+            timer.mark("dispatch_commit")
             await wait_future
+            timer.mark("wait_switch_complete")
             self._wait_for_new_engine_ready(new_core_engines)
+            timer.mark("wait_new_engines_ready")
         except Exception:
             wait_future.cancel()
             raise
 
         self.core_engines.extend(new_core_engines)
+        timer.mark("publish_new_engines")
         # Update the parallel config
         parallel_config = self.vllm_config.parallel_config
         parallel_config.data_parallel_size = new_data_parallel_size
@@ -1788,12 +1795,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             ("SCALE_ELASTIC_EP", new_data_parallel_size)
         )
         await self.first_req_send_socket.send(scale_up_marker)
+        timer.mark("update_coordinator")
 
         logger.info(
             "[Elastic EP] Scale up completed, new data parallel size: %s",
             new_data_parallel_size,
         )
         await self.resume_scheduler_async()
+        timer.mark("resume_schedulers")
+        timer.total()
 
     async def _prepare_scale_down_elastic_ep(self, new_data_parallel_size: int) -> None:
         self._setup_elastic_ep_reconfig_bootstrap()
@@ -1812,6 +1822,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def _commit_scale_down_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Scale down the data parallel size by shutting down and
         reconfiguring existing engine cores."""
+        timer = StageTimer("client.commit_scale_down", synchronize_gpu=False)
         cur_data_parallel_size = len(self.core_engines)
 
         self.eep_scaling_cache = ElasticScalingCache(
@@ -1831,6 +1842,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for mode, engine in zip(pause_modes, old_core_engines)
         ]
         await asyncio.gather(*pause_futures)
+        timer.mark("pause_schedulers")
         assert isinstance(self.resources.engine_manager, CoreEngineActorManager)
         self.resources.engine_manager.remove_run_refs_for_scale_down(removed_dp_size)
         wait_future = self._eep_wait_for_setup_switch_complete()
@@ -1852,6 +1864,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
 
         try:
             await asyncio.gather(*reconfig_futures)
+            timer.mark("dispatch_commit")
 
             self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
             self._ensure_stats_update_task()
@@ -1859,8 +1872,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 ("SCALE_ELASTIC_EP", new_data_parallel_size)
             )
             await self.first_req_send_socket.send(scale_down_marker)
+            timer.mark("update_coordinator")
             await wait_future
+            timer.mark("wait_switch_complete")
             await self.resume_scheduler_async()
+            timer.mark("resume_schedulers")
         except Exception:
             wait_future.cancel()
             raise
@@ -1869,3 +1885,4 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             "[Elastic EP] Scale down completed, new data parallel size: %s",
             new_data_parallel_size,
         )
+        timer.total()

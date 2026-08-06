@@ -29,6 +29,7 @@ from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
 )
+from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -678,6 +679,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        timer = StageTimer("worker.compile_or_warm_up")
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -702,20 +704,25 @@ class Worker(WorkerBase):
             for compile_range in compile_ranges:
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
+        timer.mark("select_compile_sizes")
 
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+        timer.mark("compile_warmup_sizes")
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        timer.mark("remove_loras")
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
+        timer.mark("kernel_warmup")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        timer.mark("capture_model")
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -790,6 +797,7 @@ class Worker(WorkerBase):
             logger.info(msg)
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
+        timer.mark("memory_accounting")
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
@@ -815,10 +823,12 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+        timer.mark("post_capture_model_warmup")
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
+        timer.mark("reset_seed")
 
         # Eagerly trigger inductor's once-per-process lazy inits during
         # warmup (rather than on a later compile cache-miss at runtime).
@@ -829,6 +839,7 @@ class Worker(WorkerBase):
             )
 
             trigger_inductor_lazy_init(self.device)
+        timer.mark("inductor_lazy_init")
 
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
@@ -838,11 +849,13 @@ class Worker(WorkerBase):
             mode=self.observability_config.jit_monitor_mode,
             verbose=self.observability_config.jit_monitor_verbose,
         )
+        timer.mark("activate_jit_monitor")
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        timer.mark("freeze_gc")
 
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`
         # gate so subsequent `execute_model` / `sample_tokens` calls enforce it.
@@ -851,6 +864,8 @@ class Worker(WorkerBase):
         # Startup is done; steady-state serving gets no benefit from torch
         # intra-op parallelism.
         set_torch_threads_for_runtime()
+        timer.mark("finish_runtime_setup")
+        timer.total()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

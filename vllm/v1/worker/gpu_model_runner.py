@@ -6797,6 +6797,10 @@ class GPUModelRunner(
             )
             return 0
 
+        from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
+
+        timer = StageTimer("worker.capture_model")
+
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()
 
@@ -6845,11 +6849,13 @@ class GPUModelRunner(
             logger.info_once(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
+        timer.mark("setup")
 
         with graph_capture(device=self.device):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            timer.mark("clear_allocator")
 
             for (
                 runtime_mode,
@@ -6861,14 +6867,17 @@ class GPUModelRunner(
                     profiler=profiler,
                 )
                 torch.accelerator.synchronize()
+                timer.mark(f"capture_{runtime_mode.name.lower()}")
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
                 encoder_graph_pool = current_platform.graph_pool_handle()
                 self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)
+            timer.mark("capture_encoder")
 
             torch.accelerator.synchronize()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+        timer.mark("exit_capture_context")
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -6883,6 +6892,8 @@ class GPUModelRunner(
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
+        timer.mark("post_capture_cleanup")
+        timer.total()
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time

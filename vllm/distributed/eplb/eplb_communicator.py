@@ -24,6 +24,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
 )
+from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_pp_group,
@@ -579,6 +580,7 @@ class NixlEplbCommunicator(EplbCommunicator):
             self._layer_idx = None
 
     def __del__(self) -> None:
+        timer = StageTimer("worker.nixl_eplb_destroy", synchronize_gpu=False)
         with contextlib.suppress(Exception):
             for local_h, remote_h, xfer_h in self._xfer_entries:
                 with contextlib.suppress(Exception):
@@ -588,15 +590,22 @@ class NixlEplbCommunicator(EplbCommunicator):
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.release_dlist_handle(remote_h)
         with contextlib.suppress(Exception):
+            timer.mark("release_transfer_handles", synchronize_gpu=True)
+        with contextlib.suppress(Exception):
             for descs in self._registered_descs:
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.deregister_memory(descs)
             self._registered_descs.clear()
         with contextlib.suppress(Exception):
+            timer.mark("deregister_memory", synchronize_gpu=True)
+        with contextlib.suppress(Exception):
             for agent_name in self._remote_agents.values():
                 with contextlib.suppress(Exception):
                     self._nixl_wrapper.remove_remote_agent(agent_name)
             self._remote_agents.clear()
+        with contextlib.suppress(Exception):
+            timer.mark("remove_remote_agents", synchronize_gpu=True)
+            timer.total()
 
 
 class PyNcclEplbCommunicator(EplbCommunicator):

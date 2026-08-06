@@ -36,6 +36,7 @@ from torch.distributed import ProcessGroup, all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
+from vllm.distributed.elastic_ep.diagnostic_timing import StageTimer
 from vllm.distributed.parallel_state import (
     get_ep_group,
     get_eplb_group,
@@ -735,6 +736,11 @@ class EplbState:
                 when scaling is done in EEP.
         """
 
+        schedule_timer = (
+            StageTimer("worker.eplb_schedule")
+            if self.is_async and not is_profile
+            else None
+        )
         ep_group = get_ep_group().device_group
         ep_rank = ep_group.rank()
 
@@ -776,8 +782,12 @@ class EplbState:
 
             global_expert_load_window = logical_expert_load_window.sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)
+        if schedule_timer is not None:
+            schedule_timer.mark("build_logical_loads")
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        if schedule_timer is not None:
+            schedule_timer.mark("allreduce_loads")
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
@@ -808,6 +818,8 @@ class EplbState:
                 "not using hierarchical rearrangement algorithm.\n"
                 f"{num_gpus=}, {num_nodes=}"
             )
+        if schedule_timer is not None:
+            schedule_timer.mark("resolve_topology")
 
         # Get new expert mappings
         for eplb_model_state, global_expert_load_window in zip(
@@ -924,7 +936,10 @@ class EplbState:
                 eplb_model_state.rebalanced = True
         # Signal async thread to start transferring layers
         if self.is_async and (not is_profile):
+            assert schedule_timer is not None
+            schedule_timer.mark("snapshot_stats")
             self.rearrange_event.record()
+            schedule_timer.mark("signal_background", synchronize_gpu=False)
         return None
 
     def start_async_loop(
