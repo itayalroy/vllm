@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -11,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import P2POp
 
+import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -763,7 +765,23 @@ class ElasticEPScalingExecutor:
         # directly with skip_eplb=True so dummy routing doesn't pollute the
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
+        if envs.VLLM_DEBUG_WORKSPACE:
+            sync_start = time.perf_counter()
+            torch.accelerator.synchronize()
+            dummy_start = time.perf_counter()
         runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+        if envs.VLLM_DEBUG_WORKSPACE:
+            dummy_call_end = time.perf_counter()
+            torch.accelerator.synchronize()
+            dummy_end = time.perf_counter()
+            logger.info(
+                "[WORKSPACE DEBUG] Elastic EP max-token dummy: "
+                "prior_sync=%.3f s, call=%.3f s, tail_sync=%.3f s, total=%.3f s",
+                dummy_start - sync_start,
+                dummy_call_end - dummy_start,
+                dummy_end - dummy_call_end,
+                dummy_end - dummy_start,
+            )
         self.worker.compile_or_warm_up_model()
 
         lock_workspace()

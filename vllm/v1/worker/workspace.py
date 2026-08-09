@@ -3,6 +3,7 @@
 
 import inspect
 import os
+import time
 from itertools import accumulate
 from math import prod
 
@@ -43,6 +44,8 @@ class WorkspaceManager:
             None
         ] * self._num_ubatches
         self._locked: bool = False
+        self._debug_ensure_calls = 0
+        self._debug_resize_calls = 0
 
     @staticmethod
     def _workspace_size_bytes(workspace: torch.Tensor | None) -> int:
@@ -60,12 +63,15 @@ class WorkspaceManager:
         self._locked = True
         if envs.VLLM_DEBUG_WORKSPACE:
             logger.info(
-                "[WORKSPACE DEBUG] Workspace locked. Current sizes: %s",
+                "[WORKSPACE DEBUG] Workspace locked. Current sizes: %s; "
+                "ensure calls: %d; resizes: %d",
                 [
                     self._workspace_size_bytes(ws) / _MB
                     for ws in self._current_workspaces
                     if ws is not None
                 ],
+                self._debug_ensure_calls,
+                self._debug_resize_calls,
             )
 
     def unlock(self) -> None:
@@ -76,6 +82,8 @@ class WorkspaceManager:
         """
         self._locked = False
         if envs.VLLM_DEBUG_WORKSPACE:
+            self._debug_ensure_calls = 0
+            self._debug_resize_calls = 0
             logger.info(
                 "[WORKSPACE DEBUG] Workspace unlocked. Current sizes: %s",
                 [
@@ -128,6 +136,8 @@ class WorkspaceManager:
         ubatch_id = dbo_current_ubatch_id()
         current_workspace = self._current_workspaces[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
+        if envs.VLLM_DEBUG_WORKSPACE:
+            self._debug_ensure_calls += 1
 
         if current_size < required_bytes:
 
@@ -165,27 +175,37 @@ class WorkspaceManager:
             # ubatches resize lazily on their next get_simultaneous call.
             # Resizing all ubatches here would orphan the other ubatch's
             # old tensor when it still holds views into it (DBO leak).
+            resize_start = time.perf_counter()
             self._current_workspaces[ubatch_id] = None
             del current_workspace
+            release_end = time.perf_counter()
             # Release the freed segment back to CUDA so the caching
             # allocator can reuse the GPU memory for the larger
             # allocation below. Without this, each resize may leave a
             # dead segment in reserved memory which can cause higher peak
             # memory usage.
             torch.accelerator.empty_cache()
+            empty_cache_end = time.perf_counter()
             self._current_workspaces[ubatch_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )
+            allocation_end = time.perf_counter()
             current_workspace = self._current_workspaces[ubatch_id]
 
             if envs.VLLM_DEBUG_WORKSPACE:
+                self._debug_resize_calls += 1
                 logger.info(
                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
-                    "%.2f MB (ubatch %d)",
+                    "%.2f MB (ubatch %d); release=%.3f ms, empty_cache=%.3f ms, "
+                    "allocation=%.3f ms, total=%.3f ms",
                     get_caller_info(),
                     current_size / _MB,
                     required_bytes / _MB,
                     ubatch_id,
+                    (release_end - resize_start) * 1000,
+                    (empty_cache_end - release_end) * 1000,
+                    (allocation_end - empty_cache_end) * 1000,
+                    (allocation_end - resize_start) * 1000,
                 )
 
         return current_workspace
