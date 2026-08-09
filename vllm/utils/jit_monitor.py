@@ -48,6 +48,16 @@ def is_active() -> bool:
     return _active
 
 
+def preload() -> None:
+    """Load monitored JIT runtimes without enabling monitoring."""
+    modules = ["cutlass.cute", "tilelang.jit.kernel", "tilelang.jit"]
+    if HAS_TRITON:
+        modules += ["triton", "triton.runtime.jit"]
+    for module in modules:
+        with suppress(Exception):
+            importlib.import_module(module)
+
+
 def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
     """Enable JIT compilation monitoring after warmup.
 

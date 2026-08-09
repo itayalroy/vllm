@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
 )
 from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.utils import is_moe_layer
+from vllm.utils.jit_monitor import preload as preload_jit_monitor
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
@@ -735,6 +736,7 @@ class ElasticEPScalingExecutor:
     def warmup_local_kernels(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             kernel_warmup(self.worker, process_local_only=True)
+        preload_jit_monitor()
 
     def warm_and_capture(self) -> None:
         # Must run on every DP sibling in lockstep: _dummy_run calls
