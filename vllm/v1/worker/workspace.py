@@ -258,6 +258,16 @@ def lock_workspace() -> None:
     current_workspace_manager().lock()
 
 
+def get_workspace_size() -> int:
+    manager = current_workspace_manager()
+    workspace = manager._current_workspaces[dbo_current_ubatch_id()]
+    return manager._workspace_size_bytes(workspace)
+
+
+def reserve_workspace(size: int) -> None:
+    current_workspace_manager()._ensure_workspace_size(size)
+
+
 def unlock_workspace() -> None:
     """Unlock the workspace to allow growth.
 

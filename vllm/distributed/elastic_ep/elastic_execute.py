@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed import P2POp
 
+import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -49,7 +50,12 @@ from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.utils import is_moe_layer
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
-from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
+from vllm.v1.worker.workspace import (
+    get_workspace_size,
+    lock_workspace,
+    reserve_workspace,
+    unlock_workspace,
+)
 
 logger = init_logger(__name__)
 
@@ -292,16 +298,14 @@ class ElasticEPScalingExecutor:
     def transfer_weights(self, old_dp_size: int, new_dp_size: int) -> None:
         standby_dp_group = get_standby_dp_group()
         assert standby_dp_group is not None
-        # Broadcast old_dp_size to all workers in standby group
+        # Broadcast scale-up metadata to all workers in standby group.
         if standby_dp_group.rank_in_group < old_dp_size:
-            old_dp_size_tensor = torch.tensor(
-                [old_dp_size], dtype=torch.int64, device="cpu"
+            metadata = torch.tensor(
+                [old_dp_size, get_workspace_size()], dtype=torch.int64, device="cpu"
             )
         else:
-            old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = standby_dp_group.tcp_store_group.broadcast(
-            old_dp_size_tensor, 0
-        )
+            metadata = torch.empty(2, dtype=torch.int64, device="cpu")
+        standby_dp_group.tcp_store_group.broadcast(metadata, 0)
 
         num_new_workers = new_dp_size - old_dp_size
         dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
@@ -665,10 +669,11 @@ class ElasticEPScalingExecutor:
         new_dp_size = dp_group.world_size
         dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
 
-        # Receive old_dp_size broadcasted during transfer_weights
-        old_dp_size_tensor = torch.empty(1, dtype=torch.int64, device="cpu")
-        old_dp_size_tensor = dp_group.tcp_store_group.broadcast(old_dp_size_tensor, 0)
-        old_dp_size = int(old_dp_size_tensor[0].item())
+        # Receive metadata broadcasted during transfer_weights.
+        metadata = torch.empty(2, dtype=torch.int64, device="cpu")
+        metadata = dp_group.tcp_store_group.broadcast(metadata, 0)
+        old_dp_size, workspace_size = metadata.tolist()
+        reserve_workspace(workspace_size)
 
         # Calculate which existing worker will send to this new worker
         num_new_workers = new_dp_size - old_dp_size
@@ -755,15 +760,14 @@ class ElasticEPScalingExecutor:
         # any captured CUDA graph with a stale data pointer; drop graphs
         # before re-warm so captures realign with the resized buffer.
         self._release_cuda_graphs()
-        unlock_workspace()
-
-        # Grow the MoE workspace at max_num_tokens. compile_or_warm_up_model
-        # alone only exercises cudagraph-capture sizes and can leave the
-        # workspace too small for post-reshuffle routing. Use _dummy_run
-        # directly with skip_eplb=True so dummy routing doesn't pollute the
-        # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
-        runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+        if (
+            self.worker.vllm_config.parallel_config.data_parallel_size
+            > envs.VLLM_ELASTIC_EP_MAX_DP_SIZE
+        ):
+            unlock_workspace()
+            # Grow the MoE workspace at max_num_tokens without polluting EPLB stats.
+            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
         self.worker.compile_or_warm_up_model()
 
         lock_workspace()
