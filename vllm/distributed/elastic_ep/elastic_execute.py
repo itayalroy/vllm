@@ -766,8 +766,9 @@ class ElasticEPScalingExecutor:
         # directly with skip_eplb=True so dummy routing doesn't pollute the
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
-        runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        with runner.skip_dp_coordination():
+            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+            self.worker.compile_or_warm_up_model()
 
         lock_workspace()
 
