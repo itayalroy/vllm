@@ -423,13 +423,22 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             topk=topk_ids.size(-1),
         )
 
-        fp8_m_grouped_gemm_nt_masked(
-            (a1q, a1q_scale),
-            (w1, self.w1_scale),
-            workspace1,
-            expert_num_tokens,
-            expected_m,
-        )
+        try:
+            fp8_m_grouped_gemm_nt_masked(
+                (a1q, a1q_scale),
+                (w1, self.w1_scale),
+                workspace1,
+                expert_num_tokens,
+                expected_m,
+            )
+        except RuntimeError as err:
+            raise RuntimeError(
+                "DeepGEMM gate/up shapes: "
+                f"activation={tuple(a1q.shape)}, weight={tuple(w1.shape)}, "
+                f"output={tuple(workspace1.shape)}, "
+                f"counts={tuple(expert_num_tokens.shape)}, "
+                f"expected_m={expected_m}"
+            ) from err
 
         quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
         a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
@@ -438,10 +447,19 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
             quant_scale_fmt=quant_scale_fmt,
         )
 
-        fp8_m_grouped_gemm_nt_masked(
-            (a2q, a2q_scale),
-            (w2, self.w2_scale),
-            output,
-            expert_num_tokens,
-            expected_m,
-        )
+        try:
+            fp8_m_grouped_gemm_nt_masked(
+                (a2q, a2q_scale),
+                (w2, self.w2_scale),
+                output,
+                expert_num_tokens,
+                expected_m,
+            )
+        except RuntimeError as err:
+            raise RuntimeError(
+                "DeepGEMM down-projection shapes: "
+                f"activation={tuple(a2q.shape)}, weight={tuple(w2.shape)}, "
+                f"output={tuple(output.shape)}, "
+                f"counts={tuple(expert_num_tokens.shape)}, "
+                f"expected_m={expected_m}"
+            ) from err
