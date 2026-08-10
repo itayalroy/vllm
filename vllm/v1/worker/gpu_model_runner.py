@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -458,6 +458,31 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+
+
+@dataclass
+class _CUDAGraphRunTiming:
+    schedule_setup: float = 0.0
+    batch_coordination: float = 0.0
+    batch_metadata: float = 0.0
+    input_prep: float = 0.0
+    model_setup: float = 0.0
+    model_forward: float = 0.0
+    model_postprocess: float = 0.0
+    finalize: float = 0.0
+
+
+@dataclass
+class _CUDAGraphShapeTiming:
+    runtime_mode: CUDAGraphMode
+    num_tokens: int
+    warmup: _CUDAGraphRunTiming = field(default_factory=_CUDAGraphRunTiming)
+    capture: _CUDAGraphRunTiming = field(default_factory=_CUDAGraphRunTiming)
+    descriptor_setup: float = 0.0
+    warmup_host: float = 0.0
+    warmup_sync: float = 0.0
+    capture_host: float = 0.0
+    descriptor_sync: float = 0.0
 
 
 class GPUModelRunner(
@@ -5822,6 +5847,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        timing: _CUDAGraphRunTiming | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5850,6 +5876,7 @@ class GPUModelRunner(
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
         """
+        timing_start = time.perf_counter() if timing is not None else 0.0
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
@@ -5912,6 +5939,11 @@ class GPUModelRunner(
 
         num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
 
+        if timing is not None:
+            now = time.perf_counter()
+            timing.schedule_setup += now - timing_start
+            timing_start = now
+
         _cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(
                 num_tokens=num_tokens_unpadded,
@@ -5936,6 +5968,10 @@ class GPUModelRunner(
                 force_num_active_loras=num_active_loras,
             )
         )
+        if timing is not None:
+            now = time.perf_counter()
+            timing.batch_coordination += now - timing_start
+            timing_start = now
 
         if cudagraph_runtime_mode is None:
             cudagraph_runtime_mode = _cudagraph_mode
@@ -5984,6 +6020,11 @@ class GPUModelRunner(
         if slot_mappings_by_group is not None:
             for sm in slot_mappings_by_group.values():
                 sm.fill_(-1)
+
+        if timing is not None:
+            now = time.perf_counter()
+            timing.batch_metadata += now - timing_start
+            timing_start = now
 
         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
         # etc.) with execute_model.  It must participate in the same event
@@ -6062,6 +6103,11 @@ class GPUModelRunner(
                     use_spec_decode=self.speculative_config is not None,
                 )
 
+        if timing is not None:
+            now = time.perf_counter()
+            timing.input_prep += now - timing_start
+            timing_start = now
+
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -6118,6 +6164,11 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            if timing is not None:
+                now = time.perf_counter()
+                timing.model_setup += now - timing_start
+                timing_start = now
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -6138,6 +6189,11 @@ class GPUModelRunner(
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+
+            if timing is not None:
+                now = time.perf_counter()
+                timing.model_forward += now - timing_start
+                timing_start = now
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -6189,6 +6245,11 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings,
                 )
 
+        if timing is not None:
+            now = time.perf_counter()
+            timing.model_postprocess += now - timing_start
+            timing_start = now
+
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
         # torch dynamo and causing graph breaks.
@@ -6214,6 +6275,8 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+        if timing is not None:
+            timing.finalize += time.perf_counter() - timing_start
         return hidden_states, hidden_states[logit_indices_device]
 
     @torch.inference_mode()
@@ -6797,8 +6860,21 @@ class GPUModelRunner(
             )
             return 0
 
+        capture_stages: dict[str, float] | None = None
+        shape_timings: list[_CUDAGraphShapeTiming] | None = None
+        capture_timing_start = 0.0
+        timing_start = 0.0
+        if envs.VLLM_CUDAGRAPH_CAPTURE_TIMING:
+            capture_stages = {}
+            shape_timings = []
+            capture_timing_start = timing_start = time.perf_counter()
+
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["initialize_encoder"] = now - timing_start
+            timing_start = now
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
@@ -6846,10 +6922,34 @@ class GPUModelRunner(
                 "Rank %d: Torch profiler disabled for CUDA graph capture", local_rank
             )
 
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["capture_setup"] = now - timing_start
+            timing_start = now
+
         with graph_capture(device=self.device):
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["graph_context_enter"] = now - timing_start
+                timing_start = now
+
             torch.accelerator.synchronize()
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["initial_sync"] = now - timing_start
+                timing_start = now
+
             torch.accelerator.empty_cache()
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["initial_empty_cache"] = now - timing_start
+                timing_start = now
+
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["initial_memory_info"] = now - timing_start
+                timing_start = now
 
             for (
                 runtime_mode,
@@ -6859,16 +6959,46 @@ class GPUModelRunner(
                     batch_descriptors=batch_descs,
                     cudagraph_runtime_mode=runtime_mode,
                     profiler=profiler,
+                    capture_timings=shape_timings,
+                    capture_stages=capture_stages,
                 )
+                if capture_stages is not None:
+                    timing_start = time.perf_counter()
                 torch.accelerator.synchronize()
+                if capture_stages is not None:
+                    now = time.perf_counter()
+                    capture_stages[f"{runtime_mode.name.lower()}.mode_sync"] = (
+                        now - timing_start
+                    )
+                    timing_start = now
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
+                if capture_stages is not None:
+                    timing_start = time.perf_counter()
                 encoder_graph_pool = current_platform.graph_pool_handle()
                 self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)
+                if capture_stages is not None:
+                    now = time.perf_counter()
+                    capture_stages["encoder_capture"] = now - timing_start
+                    timing_start = now
 
             torch.accelerator.synchronize()
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["final_sync"] = now - timing_start
+                timing_start = now
+
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            if capture_stages is not None:
+                now = time.perf_counter()
+                capture_stages["final_memory_info"] = now - timing_start
+                timing_start = now
+
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["graph_context_exit"] = now - timing_start
+            timing_start = now
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -6876,13 +7006,30 @@ class GPUModelRunner(
         # we may do lazy capturing in future that still allows capturing
         # after here.
         set_cudagraph_capturing_enabled(False)
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["disable_capture"] = now - timing_start
+            timing_start = now
 
         torch.accelerator.synchronize()
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["cleanup_sync"] = now - timing_start
+            timing_start = now
+
         torch.accelerator.empty_cache()
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["cleanup_empty_cache"] = now - timing_start
+            timing_start = now
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
         lock_workspace()
+        if capture_stages is not None:
+            now = time.perf_counter()
+            capture_stages["lock_workspace"] = now - timing_start
+            timing_start = now
 
         end_time = time.perf_counter()
         elapsed_time = end_time - start_time
@@ -6893,7 +7040,97 @@ class GPUModelRunner(
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        if capture_stages is not None and shape_timings is not None:
+            self._log_cudagraph_capture_timings(
+                end_time - capture_timing_start,
+                capture_stages,
+                shape_timings,
+            )
         return cuda_graph_size
+
+    def _log_cudagraph_capture_timings(
+        self,
+        total: float,
+        capture_stages: dict[str, float],
+        shape_timings: list[_CUDAGraphShapeTiming],
+    ) -> None:
+        from vllm.distributed.parallel_state import get_world_group
+
+        rank = get_world_group().rank
+        shape_total = sum(
+            timing.descriptor_setup
+            + timing.warmup_host
+            + timing.warmup_sync
+            + timing.capture_host
+            + timing.descriptor_sync
+            for timing in shape_timings
+        )
+        accounted = sum(capture_stages.values()) + shape_total
+        stages = ",".join(
+            f"{name}={elapsed * 1000:.3f}" for name, elapsed in capture_stages.items()
+        )
+        logger.info(
+            "[CUDA graph timing] rank=%d total_ms=%.3f accounted_ms=%.3f "
+            "unattributed_ms=%.3f stages_ms={%s}",
+            rank,
+            total * 1000,
+            accounted * 1000,
+            (total - accounted) * 1000,
+            stages,
+        )
+
+        run_stages = tuple(_CUDAGraphRunTiming.__dataclass_fields__)
+        for runtime_mode in dict.fromkeys(
+            timing.runtime_mode for timing in shape_timings
+        ):
+            timings = [
+                timing
+                for timing in shape_timings
+                if timing.runtime_mode == runtime_mode
+            ]
+            values = {
+                name: (
+                    "["
+                    + ",".join(
+                        f"{getattr(timing, name) * 1000:.3f}" for timing in timings
+                    )
+                    + "]"
+                )
+                for name in (
+                    "descriptor_setup",
+                    "warmup_host",
+                    "warmup_sync",
+                    "capture_host",
+                    "descriptor_sync",
+                )
+            }
+            run_totals = {}
+            for name in ("warmup", "capture"):
+                totals = []
+                for stage in run_stages:
+                    elapsed = sum(
+                        getattr(getattr(timing, name), stage) for timing in timings
+                    )
+                    totals.append(f"{stage}={elapsed * 1000:.3f}")
+                run_totals[name] = ",".join(totals)
+
+            logger.info(
+                "[CUDA graph timing] rank=%d mode=%s shapes=%d "
+                "warmup_run_ms={%s} capture_run_ms={%s} tokens=%s "
+                "descriptor_setup_ms=%s warmup_host_ms=%s warmup_sync_ms=%s "
+                "capture_host_ms=%s descriptor_sync_ms=%s",
+                rank,
+                runtime_mode.name,
+                len(timings),
+                run_totals["warmup"],
+                run_totals["capture"],
+                [timing.num_tokens for timing in timings],
+                values["descriptor_setup"],
+                values["warmup_host"],
+                values["warmup_sync"],
+                values["capture_host"],
+                values["descriptor_sync"],
+            )
 
     def _warmup_and_capture(
         self,
@@ -6903,12 +7140,14 @@ class GPUModelRunner(
         allow_microbatching: bool = False,
         num_warmups: int | None = None,
         profiler: AbstractContextManager[Any] | None = None,
+        timing: _CUDAGraphShapeTiming | None = None,
     ):
         if profiler is None:
             profiler = nullcontext()
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        timing_start = time.perf_counter() if timing is not None else 0.0
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6920,11 +7159,22 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                timing=timing.warmup if timing is not None else None,
             )
+        if timing is not None:
+            now = time.perf_counter()
+            timing.warmup_host = now - timing_start
+            timing_start = now
+
         if num_warmups > 0:
             # Warmups may use auxiliary streams. Ensure all of their work has
             # completed before beginning CUDA graph capture.
             torch.accelerator.synchronize()
+        if timing is not None:
+            now = time.perf_counter()
+            timing.warmup_sync = now - timing_start
+            timing_start = now
+
         with (
             profiler,
             torch.profiler.record_function(
@@ -6941,13 +7191,18 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
+                timing=timing.capture if timing is not None else None,
             )
+        if timing is not None:
+            timing.capture_host = time.perf_counter() - timing_start
 
     def _capture_cudagraphs(
         self,
         batch_descriptors: list[BatchDescriptor],
         cudagraph_runtime_mode: CUDAGraphMode,
         profiler: AbstractContextManager[Any] | None = None,
+        capture_timings: list[_CUDAGraphShapeTiming] | None = None,
+        capture_stages: dict[str, float] | None = None,
     ):
         assert (
             cudagraph_runtime_mode != CUDAGraphMode.NONE
@@ -6972,6 +7227,7 @@ class GPUModelRunner(
 
         # We skip EPLB here since we don't want to record dummy metrics
         for batch_desc in batch_descriptors:
+            timing_start = time.perf_counter() if capture_timings is not None else 0.0
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -6986,14 +7242,34 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                 )
             )
+            shape_timing = (
+                _CUDAGraphShapeTiming(cudagraph_runtime_mode, batch_desc.num_tokens)
+                if capture_timings is not None
+                else None
+            )
+            if shape_timing is not None:
+                shape_timing.descriptor_setup = time.perf_counter() - timing_start
+
             self._warmup_and_capture(
                 batch_desc,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
                 profiler=profiler,
+                timing=shape_timing,
             )
+            if shape_timing is not None:
+                timing_start = time.perf_counter()
             torch.accelerator.synchronize()
+            if shape_timing is not None and capture_timings is not None:
+                shape_timing.descriptor_sync = time.perf_counter() - timing_start
+                capture_timings.append(shape_timing)
+
+        timing_start = time.perf_counter() if capture_stages is not None else 0.0
         self.maybe_remove_all_loras(self.lora_config)
+        if capture_stages is not None:
+            capture_stages[f"{cudagraph_runtime_mode.name.lower()}.remove_loras"] = (
+                time.perf_counter() - timing_start
+            )
 
     def initialize_attn_backend(
         self,
