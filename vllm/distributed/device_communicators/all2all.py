@@ -508,12 +508,14 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         assert NixlEPAll2AllManager._buffer is not None
         buffer = NixlEPAll2AllManager._buffer.buffer
         for rank in peers:
-            buffer.update_mask_buffer(rank, mask=True)
+            buffer.update_mask_buffer(rank, mask=True, update_active_rank_bound=False)
         try:
             yield
         finally:
             for rank in peers:
-                buffer.update_mask_buffer(rank, mask=False)
+                buffer.update_mask_buffer(
+                    rank, mask=False, update_active_rank_bound=False
+                )
 
     def _ensure_ep_size(self, *, stage: bool) -> None:
         if stage:
