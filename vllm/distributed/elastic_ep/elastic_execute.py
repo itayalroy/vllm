@@ -4,6 +4,7 @@ import gc
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,7 @@ from vllm.distributed import (
     get_pcp_group,
     get_tp_group,
 )
+from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
@@ -42,6 +44,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    get_ep_all2all_manager,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
@@ -766,9 +771,17 @@ class ElasticEPScalingExecutor:
         # directly with skip_eplb=True so dummy routing doesn't pollute the
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
+        all2all_manager = get_ep_all2all_manager()
+        capture_context = (
+            all2all_manager.mask_remote_ranks()
+            if isinstance(all2all_manager, NixlEPAll2AllManager)
+            else nullcontext()
+        )
         with runner.skip_dp_coordination():
             runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-            self.worker.compile_or_warm_up_model()
+            torch.accelerator.synchronize()
+            with capture_context:
+                self.worker.compile_or_warm_up_model()
 
         lock_workspace()
 
