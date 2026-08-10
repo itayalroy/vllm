@@ -348,7 +348,7 @@ def maybe_make_prepare_finalize(
         prepare_finalize = NixlEPPrepareAndFinalize(
             handle,
             max_tokens_per_rank=moe.max_num_tokens,
-            num_dispatchers=all2all_manager.world_size,
+            num_dispatchers=all2all_manager.max_num_ep_ranks,
             use_fp8_dispatch=use_fp8_dispatch,
             global_to_physical=global_to_physical,
             physical_to_global=physical_to_global,
