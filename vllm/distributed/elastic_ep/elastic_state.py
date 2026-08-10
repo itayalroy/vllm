@@ -205,6 +205,8 @@ class ElasticEPScalingState:
 
         elif state == ScaleUpNewEngineState.PREPARE:
             self._collective_rpc("elastic_ep_execute", args=("warmup_local_kernels",))
+            if self.vllm_config.parallel_config.all2all_backend == "nixl_ep":
+                self._collective_rpc("elastic_ep_execute", args=("warm_and_capture",))
             self._mark_ready_for_switch()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
             torch.distributed.all_reduce(

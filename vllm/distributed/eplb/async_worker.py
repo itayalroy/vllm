@@ -95,7 +95,9 @@ def transfer_run_periodically(
             # Snapshot the physical_to_logical_map (synchronized with
             # rearrange_event) and copy it to CPU
             with torch.cuda.stream(cuda_stream):
-                physical_to_logical_map_cpu = model_state.physical_to_logical_map.cpu()
+                physical_to_logical_map_cpu = model_state.physical_to_logical_map[
+                    :, : model_state.model.num_physical_experts
+                ].cpu()
 
             new_physical_to_logical_map = run_rebalance_experts(
                 model_state, state, physical_to_logical_map_cpu, cuda_stream
