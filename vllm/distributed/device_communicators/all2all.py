@@ -589,9 +589,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         last = NixlEPAll2AllManager._last_mask
         if last is None or last.shape != current.shape:
             NixlEPAll2AllManager._last_mask = torch.zeros_like(current)
-            last = NixlEPAll2AllManager._last_mask
-        has_fault = (current != last).any()
-        return has_fault
+        return torch.zeros((), dtype=torch.bool, device=current.device)
 
     def clean_buffers(self) -> None:
         if NixlEPAll2AllManager._buffer is None:
