@@ -35,7 +35,7 @@ def _serve_args(initial_dp_size: int) -> list[str]:
         "--eplb-config.num_redundant_experts",
         "0",
         "--eplb-config.use_async",
-        "true",
+        os.getenv("VLLM_TEST_ELASTIC_EP_ASYNC_EPLB", "true"),
         "--eplb-config.step_interval",
         "100000",
         "--gpu-memory-utilization",
