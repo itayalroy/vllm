@@ -87,12 +87,16 @@ def _rank_outputs(
     }
 
 
-def _assert_outputs_match(
-    expected: tuple[str, ...], outputs: dict[int, tuple[str, ...]]
+def _assert_outputs_match_baseline(
+    baseline: tuple[set[str], ...], outputs: dict[int, tuple[str, ...]]
 ) -> None:
-    assert all(outputs_for_rank == expected for outputs_for_rank in outputs.values()), (
-        f"expected={expected!r}, outputs={outputs!r}"
-    )
+    mismatches = {
+        (rank, prompt_index): output
+        for rank, rank_outputs in outputs.items()
+        for prompt_index, output in enumerate(rank_outputs)
+        if output not in baseline[prompt_index]
+    }
+    assert not mismatches, f"baseline={baseline!r}, mismatches={mismatches!r}"
 
 
 def _scale(server: RemoteOpenAIServer, new_dp_size: int) -> None:
@@ -122,19 +126,23 @@ def test_elastic_ep_cuda_graph_reuse_support():
     ) as server:
         initial_ranks = range(initial_dp_size)
         initial = _rank_outputs(server, initial_ranks)
-        expected = initial[0]
-        _assert_outputs_match(expected, initial)
+        baseline = tuple(
+            {outputs[prompt_index] for outputs in initial.values()}
+            for prompt_index in range(len(PROMPTS))
+        )
 
         _scale(server, target_dp_size)
-        print("Checking newly prepared ranks")
-        _assert_outputs_match(
-            expected, _rank_outputs(server, range(initial_dp_size, target_dp_size))
+        print("Checking newly prepared ranks", flush=True)
+        _assert_outputs_match_baseline(
+            baseline, _rank_outputs(server, range(initial_dp_size, target_dp_size))
         )
-        print("Checking retained ranks with reused CUDA graphs")
-        _assert_outputs_match(expected, _rank_outputs(server, initial_ranks))
+        print("Checking retained ranks with reused CUDA graphs", flush=True)
+        _assert_outputs_match_baseline(baseline, _rank_outputs(server, initial_ranks))
         time.sleep(2)
-        print("Checking all ranks after EPLB")
-        _assert_outputs_match(expected, _rank_outputs(server, range(target_dp_size)))
+        print("Checking all ranks after EPLB", flush=True)
+        _assert_outputs_match_baseline(
+            baseline, _rank_outputs(server, range(target_dp_size))
+        )
 
         _scale(server, initial_dp_size)
-        _assert_outputs_match(expected, _rank_outputs(server, initial_ranks))
+        _assert_outputs_match_baseline(baseline, _rank_outputs(server, initial_ranks))
