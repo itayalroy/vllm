@@ -151,6 +151,11 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # new config but leaves it inactive while the old config remains active.
         # When EEP commit switches to this P/F, this P/F needs to commit that state.
         all2all_manager.commit_staged_state()
+        state = NixlEPAll2AllManager._buffer
+        assert state is not None
+        for rank in range(all2all_manager.world_size):
+            if rank != all2all_manager.rank:
+                state.buffer.update_mask_buffer(rank, mask=True)
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return NIXL_EP_TOPK_INDICES_DTYPE
