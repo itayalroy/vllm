@@ -71,6 +71,19 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
         assert error == cuda.CUresult.CUDA_SUCCESS
         (error,) = cuda.cuGraphDestroyNode(clone_node)
         assert error == cuda.CUresult.CUDA_SUCCESS
+    if value := os.getenv("VLLM_EEP_CUDAGRAPH_DISPATCH_TOKENS"):
+        error, clone_node = cuda.cuGraphNodeFindInClone(kernels[prefix - 1][0], clone)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        error, params = cuda.cuGraphKernelNodeGetParams(clone_node)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        pointers = ctypes.cast(params.kernelParams, ctypes.POINTER(ctypes.c_void_p))
+        original = ctypes.string_at(pointers[17], ctypes.sizeof(ctypes.c_int))
+        ctypes.memmove(
+            pointers[17], ctypes.byref(ctypes.c_int(int(value))), len(original)
+        )
+        (error,) = cuda.cuGraphKernelNodeSetParams(clone_node, params)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        ctypes.memmove(pointers[17], original, len(original))
     error, graph_exec = cuda.cuGraphInstantiate(clone, 0)
     assert error == cuda.CUresult.CUDA_SUCCESS
 
