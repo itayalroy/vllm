@@ -163,6 +163,7 @@ class ElasticEPScalingExecutor:
         )
         self._async_future: Future[None] | None = None
         self._group_cleanup_future: Future[None] | None = None
+        self._retired_groups: list[tuple[GroupCoordinator | None, ...]] = []
 
     @property
     def worker(self):
@@ -231,10 +232,7 @@ class ElasticEPScalingExecutor:
                 group.destroy()
 
     def _start_group_cleanup(self, groups: tuple[GroupCoordinator | None, ...]) -> None:
-        assert self._group_cleanup_future is None
-        self._group_cleanup_future = self._async_executor.submit(
-            self._destroy_retired_groups, groups
-        )
+        self._retired_groups.append(groups)
 
     def _wait_for_group_cleanup(self) -> None:
         if (future := self._group_cleanup_future) is not None:
