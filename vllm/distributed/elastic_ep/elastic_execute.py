@@ -157,6 +157,7 @@ class ElasticEPScalingExecutor:
         self.worker_ref = weakref.ref(worker)
         self.reconfig_request = None
         self._staged_moe_quant_methods: dict[nn.Module, FusedMoEMethodBase] = {}
+        self._retired_moe_quant_methods: list[FusedMoEMethodBase] = []
         self._prepared_eplb_communicator: EplbCommunicator | None = None
         self._async_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ElasticEPAsync"
@@ -416,6 +417,7 @@ class ElasticEPScalingExecutor:
             if staged_quant_method is None:
                 continue
             assert staged_quant_method.moe_kernel is not None
+            self._retired_moe_quant_methods.append(module._quant_method)
             module._replace_quant_method(staged_quant_method)
             staged_quant_method.moe_kernel.prepare_finalize.on_commit()
         self._staged_moe_quant_methods.clear()
