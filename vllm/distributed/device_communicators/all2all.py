@@ -449,7 +449,15 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
         state.buffer.set_tcp_store_group(self.tcp_store_group.store)
         ranks_to_connect = list(range(state.connected_ep_size, ep_size))
+        logger.warning(
+            "NIXL EP context before connect: %s",
+            state.buffer.runtime.get_debug_state(),
+        )
         state.buffer.connect_ranks(ranks_to_connect, activate=make_active)
+        logger.warning(
+            "NIXL EP context after connect: %s",
+            state.buffer.runtime.get_debug_state(),
+        )
         state.connected_ep_size = ep_size
         if make_active:
             state.active_ep_size = ep_size
