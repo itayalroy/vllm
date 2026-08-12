@@ -52,6 +52,10 @@ def _serve_args(initial_dp_size: int) -> list[str]:
         args.extend(("--quantization", quantization))
     if moe_backend := os.getenv("VLLM_TEST_ELASTIC_EP_MOE_BACKEND"):
         args.extend(("--moe-backend", moe_backend))
+    if leader_address := os.getenv("LEADER_ADDRESS"):
+        args.extend(("--data-parallel-address", leader_address))
+    if local_dp_size := os.getenv("VLLM_TEST_ELASTIC_EP_LOCAL_DP"):
+        args.extend(("--data-parallel-size-local", local_dp_size))
     return args
 
 
