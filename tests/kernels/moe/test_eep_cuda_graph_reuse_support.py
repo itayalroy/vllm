@@ -107,6 +107,7 @@ def test_all_batched_expert_implementations_are_classified():
         for module in modules
         for expert in vars(module).values()
         if inspect.isclass(expert)
+        and not inspect.isabstract(expert)
         and expert.__module__ == module.__name__
         and issubclass(expert, mk.FusedMoEExpertsModular)
         and expert.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
