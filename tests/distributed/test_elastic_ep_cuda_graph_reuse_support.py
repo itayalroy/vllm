@@ -90,7 +90,9 @@ def _rank_outputs(
 def _assert_outputs_match(
     expected: tuple[str, ...], outputs: dict[int, tuple[str, ...]]
 ) -> None:
-    assert all(outputs_for_rank == expected for outputs_for_rank in outputs.values())
+    assert all(outputs_for_rank == expected for outputs_for_rank in outputs.values()), (
+        f"expected={expected!r}, outputs={outputs!r}"
+    )
 
 
 def _scale(server: RemoteOpenAIServer, new_dp_size: int) -> None:
