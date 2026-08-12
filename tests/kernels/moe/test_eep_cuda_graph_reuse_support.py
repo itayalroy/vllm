@@ -112,7 +112,10 @@ def test_all_batched_expert_implementations_are_classified():
         and expert.activation_format() == mk.FusedMoEActivationFormat.BatchedExperts
     }
 
-    assert discovered == BATCHED_EXPERTS
+    assert discovered == BATCHED_EXPERTS, (
+        f"unclassified={discovered - BATCHED_EXPERTS}, "
+        f"not_discovered={BATCHED_EXPERTS - discovered}"
+    )
 
 
 @pytest.mark.parametrize(
