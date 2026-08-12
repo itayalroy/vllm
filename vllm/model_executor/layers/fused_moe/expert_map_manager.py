@@ -210,6 +210,9 @@ class ExpertMapManager:
         self.rocm_aiter_enabled = rocm_aiter_enabled
         self.top_k = top_k
         self.max_num_batched_tokens = max_num_batched_tokens
+        self._local_num_experts: int
+        self._expert_map: torch.Tensor | None
+        self._expert_mask: torch.Tensor | None
 
         if moe_parallel_config.use_ep:
             # Determine expert placement strategy before creating manager
@@ -389,8 +392,16 @@ class ExpertMapManager:
         else:
             raise AssertionError("_expert_map or _expert_mask must be present.")
 
+        old_expert_map = self._expert_map
         with device:
             self._calculate_expert_maps()
+            if (
+                old_expert_map is not None
+                and self._expert_map is not None
+                and old_expert_map.shape == self._expert_map.shape
+            ):
+                old_expert_map.copy_(self._expert_map)
+                self._expert_map = old_expert_map
             self._routing_tables = self._init_routing_tables()
 
             # Reinitialize AITER buffer if needed and parameters provided
