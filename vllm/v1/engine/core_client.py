@@ -11,6 +11,7 @@ from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
+from datetime import timedelta
 from multiprocessing.connection import Connection
 from multiprocessing.queues import Queue
 from threading import Thread
@@ -1693,6 +1694,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             is_master=True,
             world_size=-1,
             wait_for_workers=False,
+            timeout=timedelta(seconds=1800),
         )
         parallel_config._coord_store_port = store.port
         self._coord_store = store

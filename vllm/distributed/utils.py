@@ -520,7 +520,13 @@ def get_cached_tcp_store_client(host: str, port: int) -> TCPStore:
     Cached so that every call with the same ``(host, port)`` reuses the
     same connection.  A new ``(host, port)`` evicts the old entry.
     """
-    return TCPStore(host, port, is_master=False, wait_for_workers=False)
+    return TCPStore(
+        host,
+        port,
+        is_master=False,
+        wait_for_workers=False,
+        timeout=timedelta(seconds=1800),
+    )
 
 
 def get_cpu_distributed_timeout_or_none() -> timedelta | None:
