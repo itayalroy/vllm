@@ -106,7 +106,7 @@ def _scale(server: RemoteOpenAIServer, new_dp_size: int) -> None:
     "VLLM_TEST_ELASTIC_EP_MODEL" not in os.environ,
     reason="requires an explicit Elastic EP model",
 )
-@multi_gpu_test(num_gpus=8)
+@multi_gpu_test(num_gpus=4)
 def test_elastic_ep_cuda_graph_reuse_support():
     model = os.environ["VLLM_TEST_ELASTIC_EP_MODEL"]
     initial_dp_size = int(os.getenv("VLLM_TEST_ELASTIC_EP_INITIAL_DP", "2"))
