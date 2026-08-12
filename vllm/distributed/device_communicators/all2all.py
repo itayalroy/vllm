@@ -501,6 +501,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                 self._connect_to_ep_size(target_ep_size, make_active=True)
 
             self._unmask_connected_ranks(target_ep_size)
+            torch.accelerator.synchronize()
 
     @contextmanager
     def mask_remote_ranks(self) -> Iterator[None]:
