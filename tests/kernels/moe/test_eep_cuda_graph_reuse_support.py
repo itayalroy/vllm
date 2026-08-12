@@ -77,6 +77,7 @@ from vllm.model_executor.layers.fused_moe.oracle.w4a8 import (
 from vllm.model_executor.layers.fused_moe.oracle.w4a8 import (
     backend_to_kernel_cls as w4a8_experts,
 )
+from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 
 FlashInferCuteDSLBatchedExperts = (
     flashinfer_cutedsl_batched_moe.FlashInferCuteDSLBatchedExperts
@@ -272,3 +273,49 @@ def test_cuda_graph_reuse_classification_is_complete():
         or owns_graph_visible_tensors & reference_only
         or cannot_stage & reference_only
     )
+
+
+def test_all_public_quantization_methods_are_classified():
+    moe_unquantized = {"fbgemm_fp8", "fp_quant", "torchao"}
+    representative_runtime = {
+        "fp8_per_tensor",
+        "fp8_per_block",
+        "fp8_per_channel",
+        "nvfp4_per_token",
+    }
+    checkpoint_or_layer_dependent = {
+        "fp8",
+        "modelopt_fp4",
+        "modelopt_mixed",
+        "compressed-tensors",
+        "inc",
+        "deepseek_v4_fp8",
+        "online",
+    }
+    unsupported_moe = {
+        "awq",
+        "auto_awq",
+        "modelopt",
+        "modelopt_mxfp8",
+        "auto_gptq",
+        "gptq",
+        "gptq_marlin",
+        "awq_marlin",
+        "humming",
+        "bitsandbytes",
+        "experts_int8",
+        "quark",
+        "moe_wna16",
+        "mxfp4",
+        "gpt_oss_mxfp4",
+        "int8_per_channel_weight_only",
+        "mxfp8",
+    }
+
+    classified = (
+        moe_unquantized
+        | representative_runtime
+        | checkpoint_or_layer_dependent
+        | unsupported_moe
+    )
+    assert classified == set(QUANTIZATION_METHODS)
