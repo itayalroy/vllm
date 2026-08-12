@@ -123,6 +123,24 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
     (error,) = cuda.cuGraphLaunch(graph_exec, current_stream().cuda_stream)
     assert error == cuda.CUresult.CUDA_SUCCESS
     torch.accelerator.synchronize()
+    if prefix < len(kernels) and "nixl_ep" in kernels[prefix][1]:
+        _, params = cuda.cuGraphKernelNodeGetParams(kernels[prefix][0])
+        pointers = ctypes.cast(params.kernelParams, ctypes.POINTER(ctypes.c_void_p))
+        values = [
+            int.from_bytes(ctypes.string_at(pointers[index], 4), "little")
+            for index in (17, 19)
+        ]
+        count = values[0] * values[1]
+        topk_ptr = int.from_bytes(ctypes.string_at(pointers[12], 8), "little")
+        topk = (ctypes.c_int32 * count)()
+        (error,) = cuda.cuMemcpyDtoH(
+            ctypes.addressof(topk), cuda.CUdeviceptr(topk_ptr), ctypes.sizeof(topk)
+        )
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        marker = Path(os.environ["VLLM_EEP_CUDAGRAPH_MARKER_DIR"])
+        (marker / f"topk-rank-{rank}.json").write_text(
+            json.dumps(list(topk)), encoding="utf-8"
+        )
     logger.warning("Rank %s CUDA graph prefix=%s completed", rank, prefix)
     (error,) = cuda.cuGraphExecDestroy(graph_exec)
     assert error == cuda.CUresult.CUDA_SUCCESS
