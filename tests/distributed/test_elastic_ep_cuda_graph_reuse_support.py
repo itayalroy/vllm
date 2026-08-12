@@ -72,7 +72,7 @@ def _completion(server: RemoteOpenAIServer, rank: int, prompt: str) -> str:
             "temperature": 0,
             "seed": 0,
         },
-        timeout=180,
+        timeout=10 if os.getenv("VLLM_EEP_CUDAGRAPH_PREFIX") else 180,
     )
     response.raise_for_status()
     return response.json()["choices"][0]["text"]
@@ -130,6 +130,11 @@ def test_elastic_ep_cuda_graph_reuse_support():
         env_dict={},
         max_wait_seconds=1800,
     ) as server:
+        if os.getenv("VLLM_EEP_CUDAGRAPH_PREFIX"):
+            _scale(server, target_dp_size)
+            _completion(server, 0, PROMPTS[0])
+            return
+
         initial_ranks = range(initial_dp_size)
         initial = _rank_outputs(server, initial_ranks)
         baseline = tuple(

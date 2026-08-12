@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import os
 import weakref
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -629,6 +630,10 @@ class ElasticEPScalingExecutor:
                 self.warm_and_capture()
         if is_existing_worker:
             self._start_group_cleanup(retired_groups)
+        if prefix := os.getenv("VLLM_EEP_CUDAGRAPH_PREFIX"):
+            from vllm.compilation.cuda_graph import enable_eep_cudagraph_prefix
+
+            enable_eep_cudagraph_prefix(int(prefix))
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)

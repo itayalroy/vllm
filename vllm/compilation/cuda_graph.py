@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
+import time
 import weakref
 from collections import Counter
 from collections.abc import Callable
 from contextlib import ExitStack
+from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import patch
 
@@ -27,6 +30,74 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+_eep_cudagraph_prefix: int | None = None
+
+
+def enable_eep_cudagraph_prefix(prefix: int) -> None:
+    global _eep_cudagraph_prefix
+    _eep_cudagraph_prefix = prefix
+
+
+def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
+    from cuda.bindings import driver as cuda
+
+    from vllm.distributed.parallel_state import get_dp_group
+
+    raw_graph = cudagraph.raw_cuda_graph()
+    error, _, count = cuda.cuGraphGetNodes(raw_graph)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+    error, nodes, count = cuda.cuGraphGetNodes(raw_graph, count)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+
+    nodes = list(nodes[:count])
+    kernels = []
+    for node in nodes:
+        error, node_type = cuda.cuGraphNodeGetType(node)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        if node_type == cuda.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+            error, params = cuda.cuGraphKernelNodeGetParams(node)
+            assert error == cuda.CUresult.CUDA_SUCCESS
+            error, name = cuda.cuFuncGetName(params.func)
+            assert error == cuda.CUresult.CUDA_SUCCESS
+            kernels.append((node, name.decode()))
+
+    error, clone = cuda.cuGraphClone(raw_graph)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+    cutoff = nodes.index(kernels[prefix - 1][0]) + 1 if prefix else 0
+    for node in reversed(nodes[cutoff:]):
+        error, clone_node = cuda.cuGraphNodeFindInClone(node, clone)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+        (error,) = cuda.cuGraphDestroyNode(clone_node)
+        assert error == cuda.CUresult.CUDA_SUCCESS
+    error, graph_exec = cuda.cuGraphInstantiate(clone, 0)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+
+    rank = get_dp_group().rank
+    logger.warning(
+        "Rank %s replaying CUDA graph prefix=%s/%s last=%s next=%s kernels=%s",
+        rank,
+        prefix,
+        len(kernels),
+        kernels[prefix - 1][1] if prefix else None,
+        kernels[prefix][1] if prefix < len(kernels) else None,
+        [name for _, name in kernels],
+    )
+    (error,) = cuda.cuGraphLaunch(graph_exec, current_stream().cuda_stream)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+    torch.accelerator.synchronize()
+    logger.warning("Rank %s CUDA graph prefix=%s completed", rank, prefix)
+    (error,) = cuda.cuGraphExecDestroy(graph_exec)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+    (error,) = cuda.cuGraphDestroy(clone)
+    assert error == cuda.CUresult.CUDA_SUCCESS
+    if marker_dir := os.getenv("VLLM_EEP_CUDAGRAPH_MARKER_DIR"):
+        marker = Path(marker_dir) / f"rank-{rank}"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"kernel_count={len(kernels)}\nkernel={kernels[prefix - 1][1]}\n",
+            encoding="utf-8",
+        )
+        time.sleep(2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,7 +351,9 @@ class CUDAGraphWrapper:
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
             entry.input_addresses = input_addresses
-            cudagraph = torch.cuda.CUDAGraph()
+            cudagraph = torch.cuda.CUDAGraph(
+                keep_graph=bool(os.getenv("VLLM_EEP_CUDAGRAPH_PREFIX"))
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -366,5 +439,11 @@ class CUDAGraphWrapper:
                 getattr(self.runnable, "submod_name", None),
                 batch_descriptor,
             )
+        if (
+            _eep_cudagraph_prefix is not None
+            and getattr(self.runnable, "piecewise_compile_index", None) == 2
+        ):
+            _replay_cudagraph_kernel_prefix(entry.cudagraph, _eep_cudagraph_prefix)
+            raise RuntimeError(f"CUDA graph prefix {_eep_cudagraph_prefix} completed")
         entry.cudagraph.replay()
         return entry.output
