@@ -132,6 +132,10 @@ def test_elastic_ep_cuda_graph_reuse_support():
         )
 
         _scale(server, target_dp_size)
+        print("Checking all ranks after scale-up", flush=True)
+        _assert_outputs_match_baseline(
+            baseline, _rank_outputs(server, range(target_dp_size))
+        )
         print("Checking newly prepared ranks", flush=True)
         _assert_outputs_match_baseline(
             baseline, _rank_outputs(server, range(initial_dp_size, target_dp_size))
