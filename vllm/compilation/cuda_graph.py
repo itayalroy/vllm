@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
 import dataclasses
+import json
 import os
 import time
 import weakref
@@ -73,6 +75,42 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
     assert error == cuda.CUresult.CUDA_SUCCESS
 
     rank = get_dp_group().rank
+    if marker_dir := os.getenv("VLLM_EEP_CUDAGRAPH_MARKER_DIR"):
+        _, params = cuda.cuGraphKernelNodeGetParams(kernels[prefix - 1][0])
+        arguments = []
+        for index in range(1024):
+            result = cuda.cuFuncGetParamInfo(params.func, index)
+            if result[0] == cuda.CUresult.CUDA_ERROR_INVALID_VALUE:
+                break
+            assert result[0] == cuda.CUresult.CUDA_SUCCESS
+            _, offset, size = result
+            pointers = ctypes.cast(params.kernelParams, ctypes.POINTER(ctypes.c_void_p))
+            raw = ctypes.string_at(pointers[index], size)
+            arguments.append(
+                {
+                    "index": index,
+                    "offset": offset,
+                    "size": size,
+                    "hex": raw.hex(),
+                    "unsigned": int.from_bytes(raw, "little"),
+                }
+            )
+        marker = Path(marker_dir)
+        marker.mkdir(parents=True, exist_ok=True)
+        (marker / f"arguments-rank-{rank}.json").write_text(
+            json.dumps(
+                {
+                    "rank": rank,
+                    "kernel": kernels[prefix - 1][1],
+                    "grid": [params.gridDimX, params.gridDimY, params.gridDimZ],
+                    "block": [params.blockDimX, params.blockDimY, params.blockDimZ],
+                    "shared_mem_bytes": params.sharedMemBytes,
+                    "arguments": arguments,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     logger.warning(
         "Rank %s replaying CUDA graph prefix=%s/%s last=%s next=%s kernels=%s",
         rank,
@@ -90,7 +128,7 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
     assert error == cuda.CUresult.CUDA_SUCCESS
     (error,) = cuda.cuGraphDestroy(clone)
     assert error == cuda.CUresult.CUDA_SUCCESS
-    if marker_dir := os.getenv("VLLM_EEP_CUDAGRAPH_MARKER_DIR"):
+    if marker_dir:
         marker = Path(marker_dir) / f"rank-{rank}"
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(
