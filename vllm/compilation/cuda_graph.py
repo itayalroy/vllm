@@ -357,5 +357,14 @@ class CUDAGraphWrapper:
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
         get_offloader().sync_prev_onload()
+        if self.is_debugging_mode:
+            logger.debug(
+                "Replaying cudagraph mode=%s piece=%s/%s submodule=%s batch=%s",
+                self.runtime_mode.name,
+                getattr(self.runnable, "piecewise_compile_index", None),
+                getattr(self.runnable, "total_piecewise_compiles", None),
+                getattr(self.runnable, "submod_name", None),
+                batch_descriptor,
+            )
         entry.cudagraph.replay()
         return entry.output
