@@ -73,17 +73,17 @@ def _completion(server: RemoteOpenAIServer, rank: int, prompt: str) -> str:
 
 
 def _rank_outputs(
-    server: RemoteOpenAIServer, dp_size: int
+    server: RemoteOpenAIServer, ranks: range
 ) -> dict[int, tuple[str, ...]]:
-    with ThreadPoolExecutor(max_workers=dp_size * len(PROMPTS)) as executor:
+    with ThreadPoolExecutor(max_workers=len(ranks) * len(PROMPTS)) as executor:
         futures = {
             (rank, prompt_index): executor.submit(_completion, server, rank, prompt)
-            for rank in range(dp_size)
+            for rank in ranks
             for prompt_index, prompt in enumerate(PROMPTS)
         }
     return {
         rank: tuple(futures[rank, i].result() for i in range(len(PROMPTS)))
-        for rank in range(dp_size)
+        for rank in ranks
     }
 
 
@@ -118,14 +118,21 @@ def test_elastic_ep_cuda_graph_reuse_support():
         env_dict={},
         max_wait_seconds=1800,
     ) as server:
-        initial = _rank_outputs(server, initial_dp_size)
+        initial_ranks = range(initial_dp_size)
+        initial = _rank_outputs(server, initial_ranks)
         expected = initial[0]
         _assert_outputs_match(expected, initial)
 
         _scale(server, target_dp_size)
-        _assert_outputs_match(expected, _rank_outputs(server, target_dp_size))
+        print("Checking newly prepared ranks")
+        _assert_outputs_match(
+            expected, _rank_outputs(server, range(initial_dp_size, target_dp_size))
+        )
+        print("Checking retained ranks with reused CUDA graphs")
+        _assert_outputs_match(expected, _rank_outputs(server, initial_ranks))
         time.sleep(2)
-        _assert_outputs_match(expected, _rank_outputs(server, target_dp_size))
+        print("Checking all ranks after EPLB")
+        _assert_outputs_match(expected, _rank_outputs(server, range(target_dp_size)))
 
         _scale(server, initial_dp_size)
-        _assert_outputs_match(expected, _rank_outputs(server, initial_dp_size))
+        _assert_outputs_match(expected, _rank_outputs(server, initial_ranks))
