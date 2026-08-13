@@ -133,6 +133,9 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
         kernels[prefix][1] if prefix < len(kernels) else None,
         [name for _, name in kernels],
     )
+    logger.warning("Rank %s synchronizing before CUDA graph prefix", rank)
+    torch.accelerator.synchronize()
+    logger.warning("Rank %s launching CUDA graph prefix", rank)
     (error,) = cuda.cuGraphLaunch(graph_exec, current_stream().cuda_stream)
     assert error == cuda.CUresult.CUDA_SUCCESS
     torch.accelerator.synchronize()
