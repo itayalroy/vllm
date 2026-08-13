@@ -99,15 +99,23 @@ def _replay_cudagraph_kernel_prefix(cudagraph: Any, prefix: int) -> None:
             _, offset, size = result
             pointers = ctypes.cast(params.kernelParams, ctypes.POINTER(ctypes.c_void_p))
             raw = ctypes.string_at(pointers[index], size)
-            arguments.append(
-                {
-                    "index": index,
-                    "offset": offset,
-                    "size": size,
-                    "hex": raw.hex(),
-                    "unsigned": int.from_bytes(raw, "little"),
+            argument = {
+                "index": index,
+                "offset": offset,
+                "size": size,
+                "hex": raw.hex(),
+                "unsigned": int.from_bytes(raw, "little"),
+            }
+            if index <= 15 or index == 28:
+                result, base, allocation_size = cuda.cuMemGetAddressRange(
+                    cuda.CUdeviceptr(argument["unsigned"])
+                )
+                argument["allocation"] = {
+                    "result": int(result),
+                    "base": int(base) if base is not None else None,
+                    "size": allocation_size,
                 }
-            )
+            arguments.append(argument)
         marker = Path(marker_dir)
         marker.mkdir(parents=True, exist_ok=True)
         (marker / f"arguments-rank-{rank}.json").write_text(
