@@ -152,10 +152,16 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # When EEP commit switches to this P/F, this P/F needs to commit that state.
         state = NixlEPAll2AllManager._buffer
         assert state is not None
+        logger.warning(
+            "NIXL EP context before commit: %s", state.buffer.runtime.get_debug_state()
+        )
         old_ep_size = state.active_ep_size
         all2all_manager.commit_staged_state()
         for rank in range(old_ep_size, all2all_manager.world_size):
             state.buffer.update_mask_buffer(rank, mask=True)
+        logger.warning(
+            "NIXL EP context after commit: %s", state.buffer.runtime.get_debug_state()
+        )
 
     def topk_indices_dtype(self) -> torch.dtype | None:
         return NIXL_EP_TOPK_INDICES_DTYPE
