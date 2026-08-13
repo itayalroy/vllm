@@ -275,6 +275,11 @@ class ElasticEPScalingExecutor:
         if new_dp_size > old_dp_size:
             self.transfer_weights(old_dp_size, new_dp_size)
             self._warm_target_groups(get_standby_dp_group(), get_standby_ep_group())
+            if prefix := os.getenv("VLLM_EEP_CUDAGRAPH_PRECOMMIT_PREFIX"):
+                from vllm.compilation.cuda_graph import enable_eep_cudagraph_prefix
+
+                enable_eep_cudagraph_prefix(int(prefix))
+                self.worker.model_runner._dummy_run(8, skip_eplb=True)
 
     def _prepare_eplb_communicator(self, eplb_group) -> None:
         parallel_config = self.worker.vllm_config.parallel_config
