@@ -488,6 +488,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         if target_ep_size > state.connected_ep_size:
             self._connect_to_ep_size(target_ep_size, make_active=False)
 
+    def stage_ep_size(self) -> None:
+        with NixlEPAll2AllManager._lock:
+            self._stage_ep_size()
+
     def commit_staged_state(self) -> None:
         """Commit staged NIXL EP state to the active communication set."""
         with NixlEPAll2AllManager._lock:

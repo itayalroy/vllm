@@ -268,7 +268,12 @@ class ElasticEPScalingExecutor:
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
         )
-        self.stage_standby_moe_quant_methods()
+        if self._can_reuse_cuda_graphs():
+            all2all_manager = get_ep_all2all_manager(eep_stage=True)
+            assert isinstance(all2all_manager, NixlEPAll2AllManager)
+            all2all_manager.stage_ep_size()
+        else:
+            self.stage_standby_moe_quant_methods()
         self._prepare_eplb_communicator(get_standby_eplb_group())
         if new_dp_size > old_dp_size:
             self.transfer_weights(old_dp_size, new_dp_size)
@@ -536,7 +541,12 @@ class ElasticEPScalingExecutor:
                 num_physical_experts=num_physical_experts,
                 num_local_physical_experts=num_local_experts,
             )
-            self._commit_staged_moe_quant_methods()
+            if self._can_reuse_cuda_graphs():
+                all2all_manager = get_ep_all2all_manager()
+                assert isinstance(all2all_manager, NixlEPAll2AllManager)
+                all2all_manager.commit_staged_state()
+            else:
+                self._commit_staged_moe_quant_methods()
             # Legacy modular methods need to be recreated for the new EP size.
             for module in moe_modules:
                 if getattr(module._quant_method, "wraps_legacy_quant_method", False):
