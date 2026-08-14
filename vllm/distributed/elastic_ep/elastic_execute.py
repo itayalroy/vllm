@@ -174,6 +174,12 @@ class ElasticEPScalingExecutor:
     def _can_reuse_cuda_graphs(self) -> bool:
         return self.worker.vllm_config.parallel_config.all2all_backend == "nixl_ep"
 
+    def _debug_replay_nixl_ep_peer_probe(self, phase: str) -> None:
+        if self._can_reuse_cuda_graphs():
+            all2all_manager = get_ep_all2all_manager()
+            assert isinstance(all2all_manager, NixlEPAll2AllManager)
+            all2all_manager.debug_replay_peer_probe(phase)
+
     def execute(self, execute_method: str, *args, **kwargs):
         method = getattr(self, execute_method, None)
         if method is None:
@@ -545,6 +551,7 @@ class ElasticEPScalingExecutor:
                 all2all_manager = get_ep_all2all_manager()
                 assert isinstance(all2all_manager, NixlEPAll2AllManager)
                 all2all_manager.commit_staged_state()
+                self._debug_replay_nixl_ep_peer_probe("after_unmask")
             else:
                 self._commit_staged_moe_quant_methods()
             # Legacy modular methods need to be recreated for the new EP size.
@@ -555,6 +562,7 @@ class ElasticEPScalingExecutor:
         assert self._prepared_eplb_communicator is not None
         eplb_state.update_communicator(model_config, self._prepared_eplb_communicator)
         self._prepared_eplb_communicator = None
+        self._debug_replay_nixl_ep_peer_probe("after_eplb_communicator")
 
         if (
             self.worker.vllm_config.compilation_config.mode
@@ -612,6 +620,7 @@ class ElasticEPScalingExecutor:
         # in setup_eplb_from_mapping() but don't start the thread there because
         # groups aren't ready yet.
         eplb_state.start_async_loop()
+        self._debug_replay_nixl_ep_peer_probe("after_reshuffle")
         if get_ep_group().rank == 0:
             logger.info(
                 "[Elastic EP] Expert resharding %s",

@@ -506,6 +506,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
             self._unmask_connected_ranks(target_ep_size)
 
+    def debug_replay_peer_probe(self, phase: str) -> None:
+        assert NixlEPAll2AllManager._buffer is not None
+        NixlEPAll2AllManager._buffer.buffer.debug_replay_peer_probe(phase)
+
     @contextmanager
     def mask_remote_ranks(self) -> Iterator[None]:
         peers = [rank for rank in range(self.world_size) if rank != self.rank]
