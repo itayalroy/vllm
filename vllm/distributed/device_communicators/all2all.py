@@ -499,6 +499,12 @@ class NixlEPAll2AllManager(All2AllManagerBase):
             state = NixlEPAll2AllManager._buffer
             target_ep_size = self.world_size
 
+            torch.accelerator.synchronize()
+            state.buffer.get_local_buffer_tensor(
+                torch.uint8, use_rdma_buffer=True
+            ).zero_()
+            torch.accelerator.synchronize()
+
             if target_ep_size < state.connected_ep_size:
                 self._disconnect_to_ep_size(target_ep_size)
             elif target_ep_size > state.connected_ep_size:
@@ -516,8 +522,11 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         try:
             yield
         finally:
+            torch.accelerator.synchronize()
+            buffer.get_local_buffer_tensor(torch.uint8, use_rdma_buffer=True).zero_()
             for rank in peers:
                 buffer.update_mask_buffer(rank, mask=False)
+            torch.accelerator.synchronize()
 
     def _ensure_ep_size(self, *, stage: bool) -> None:
         if stage:
