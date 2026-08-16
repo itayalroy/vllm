@@ -263,6 +263,7 @@ class NixlEPPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
         # Dispatch
         dispatch_topk_ids = self._map_global_to_physical_ids(topk_ids)
+        num_experts = num_experts * self.num_dispatchers_ // get_ep_group().world_size
         expert_x, expert_num_tokens, handle, _, hook = self.buffer.dispatch(
             a1,
             dispatch_topk_ids,
