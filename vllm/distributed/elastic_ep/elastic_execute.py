@@ -9,9 +9,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributed import P2POp
 
+from vllm import envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.wrapper import reset_compile_wrapper
@@ -41,6 +41,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.all2all_utils import (
+    get_ep_all2all_manager,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.eep_reconfigure import (
     make_eep_staged_quant_method,
@@ -105,31 +108,20 @@ def batch_transfer_weights(
 
 def broadcast_expert_mapping(
     physical_to_logical: torch.Tensor | None,
-    num_local_physical_experts: int | None,
-    num_logical_experts: int | None,
     dp_group: StatelessGroupCoordinator,
     device: torch.device,
     src_rank: int = 0,
-) -> tuple[torch.Tensor, int, int]:
+) -> torch.Tensor:
     if dp_group.rank_in_group == src_rank:
         assert physical_to_logical is not None
-        assert num_local_physical_experts is not None
-        assert num_logical_experts is not None
         assert physical_to_logical.dtype == torch.int64
         shape_tensor = torch.tensor(
             list(physical_to_logical.shape), dtype=torch.int64, device="cpu"
         )
-        metadata_tensor = torch.tensor(
-            [num_local_physical_experts, num_logical_experts],
-            dtype=torch.int64,
-            device="cpu",
-        )
     else:
         shape_tensor = torch.empty(2, dtype=torch.int64, device="cpu")
-        metadata_tensor = torch.empty(2, dtype=torch.int64, device="cpu")
 
     shape_tensor = dp_group.tcp_store_group.broadcast(shape_tensor, src_rank)
-    metadata_tensor = dp_group.tcp_store_group.broadcast(metadata_tensor, src_rank)
 
     if dp_group.rank_in_group != src_rank:
         assert device is not None
@@ -140,11 +132,7 @@ def broadcast_expert_mapping(
         )
 
     assert physical_to_logical is not None
-    physical_to_logical = dp_group.broadcast(physical_to_logical, src_rank)
-    num_local_physical_experts = int(metadata_tensor[0].item())
-    num_logical_experts = int(metadata_tensor[1].item())
-
-    return physical_to_logical, num_local_physical_experts, num_logical_experts
+    return dp_group.broadcast(physical_to_logical, src_rank)
 
 
 class ElasticEPScalingExecutor:
@@ -165,6 +153,12 @@ class ElasticEPScalingExecutor:
         if worker is None:
             raise RuntimeError("Worker has been garbage collected")
         return worker
+
+    def _can_reuse_moe_kernel(self) -> bool:
+        return (
+            self.worker.vllm_config.parallel_config.all2all_backend == "nixl_ep"
+            and not envs.VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE
+        )
 
     def execute(self, execute_method: str, *args, **kwargs):
         method = getattr(self, execute_method, None)
@@ -260,11 +254,16 @@ class ElasticEPScalingExecutor:
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
         )
-        self.stage_standby_moe_quant_methods()
+        standby_ep_group = get_standby_ep_group()
+        assert standby_ep_group is not None
+        all2all_manager = get_ep_all2all_manager(standby_ep_group)
+        all2all_manager.stage_ep_size()
+        if not self._can_reuse_moe_kernel():
+            self.stage_standby_moe_quant_methods(all2all_manager)
         self._prepare_eplb_communicator(get_standby_eplb_group())
         if new_dp_size > old_dp_size:
             self.transfer_weights(old_dp_size, new_dp_size)
-        self._warm_target_groups(get_standby_dp_group(), get_standby_ep_group())
+        self._warm_target_groups(get_standby_dp_group(), standby_ep_group)
 
     def _prepare_eplb_communicator(self, eplb_group) -> None:
         assert eplb_group is not None
@@ -339,13 +338,8 @@ class ElasticEPScalingExecutor:
         eplb_state.drain_async()
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
         physical_to_logical = eplb_model_state.physical_to_logical_map
-        num_physical_experts = physical_to_logical.shape[1]
-        num_local_physical_experts = num_physical_experts // get_ep_group().world_size
-        num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
         broadcast_expert_mapping(
             physical_to_logical=physical_to_logical,
-            num_local_physical_experts=num_local_physical_experts,
-            num_logical_experts=num_logical_experts,
             dp_group=standby_dp_group,
             src_rank=0,
             device=self.worker.device,
@@ -368,7 +362,7 @@ class ElasticEPScalingExecutor:
             moe_parallel_config=moe_parallel_config,
         )
 
-    def stage_standby_moe_quant_methods(self) -> None:
+    def stage_standby_moe_quant_methods(self, all2all_manager) -> None:
         standby_dp_group = get_standby_dp_group()
         standby_ep_group = get_standby_ep_group()
         model = self.worker.model_runner.get_model()
@@ -383,6 +377,7 @@ class ElasticEPScalingExecutor:
                         standby_dp_group,
                         standby_ep_group,
                     ),
+                    all2all_manager=all2all_manager,
                 )
                 if staged_quant_method is not None:
                     self._staged_moe_quant_methods[module] = staged_quant_method
@@ -396,7 +391,6 @@ class ElasticEPScalingExecutor:
                 continue
             assert staged_quant_method.moe_kernel is not None
             module._replace_quant_method(staged_quant_method)
-            staged_quant_method.moe_kernel.prepare_finalize.on_commit()
         self._staged_moe_quant_methods.clear()
 
     def _release_cuda_graphs(self) -> None:
@@ -430,7 +424,8 @@ class ElasticEPScalingExecutor:
         old_dp_size = get_dp_group().world_size
         old_ep_size = get_ep_group().world_size
 
-        self._release_cuda_graphs()
+        if not self._can_reuse_moe_kernel():
+            self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
 
         parallel_config = self.worker.vllm_config.parallel_config
@@ -487,41 +482,17 @@ class ElasticEPScalingExecutor:
         parallel_config.eplb_config.num_redundant_experts = (
             num_physical_experts - num_logical_experts
         )
-        old_physical_to_logical = eplb_model_state.physical_to_logical_map
-        num_moe_layers = old_physical_to_logical.shape[0]
-        num_local_experts = eplb_model_state.expert_load_pass.shape[1] // old_ep_size
         if new_dp_size > old_dp_size:
-            expanded_physical_to_logical = torch.full(
-                (num_moe_layers, num_local_experts * new_ep_size),
-                -1,
-                dtype=old_physical_to_logical.dtype,
-                device=old_physical_to_logical.device,
-            )
-            expanded_physical_to_logical[:, : num_local_experts * old_ep_size] = (
-                old_physical_to_logical
-            )
-            eplb_model_state.physical_to_logical_map = expanded_physical_to_logical
-
-        old_num_physical_experts = eplb_model_state.expert_load_pass.shape[1]
-        pad_size = num_physical_experts - old_num_physical_experts
-        if new_dp_size > old_dp_size:
-            assert pad_size > 0
-            expanded_expert_load_pass = F.pad(
-                eplb_model_state.expert_load_pass, (0, pad_size), value=0
-            )
-            expanded_expert_load_window = F.pad(
-                eplb_model_state.expert_load_window, (0, pad_size), value=0
-            )
-            eplb_model_state.expert_load_pass = expanded_expert_load_pass
-            eplb_model_state.expert_load_window = expanded_expert_load_window
-        else:
-            assert pad_size < 0
-            eplb_model_state.expert_load_pass = eplb_model_state.expert_load_pass[
-                :, :num_physical_experts
-            ]
-            eplb_model_state.expert_load_window = eplb_model_state.expert_load_window[
-                :, :, :num_physical_experts
-            ]
+            old_num_physical_experts = num_local_experts * old_ep_size
+            eplb_model_state.physical_to_logical_map[
+                :, old_num_physical_experts:num_physical_experts
+            ].fill_(-1)
+            eplb_model_state.expert_load_pass[
+                :, old_num_physical_experts:num_physical_experts
+            ].zero_()
+            eplb_model_state.expert_load_window[
+                :, :, old_num_physical_experts:num_physical_experts
+            ].zero_()
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
@@ -539,6 +510,7 @@ class ElasticEPScalingExecutor:
                 num_local_physical_experts=num_local_experts,
             )
             self._commit_staged_moe_quant_methods()
+            get_ep_all2all_manager().commit_ep_size()
             # Legacy modular methods need to be recreated for the new EP size.
             for module in moe_modules:
                 if getattr(module._quant_method, "wraps_legacy_quant_method", False):
@@ -608,8 +580,16 @@ class ElasticEPScalingExecutor:
         else:
             mapping = self.receive_expert_mapping()
             self.worker.model_runner.setup_eplb_from_mapping(mapping)
-        self.warm_and_capture()
-        self._perform_eplb_reshuffle(async_op=True)
+        eplb_state = self.worker.model_runner.eplb_state
+        assert eplb_state is not None
+        if eplb_state.is_async:
+            if not self._can_reuse_moe_kernel():
+                self.warm_and_capture()
+            self._perform_eplb_reshuffle(async_op=True)
+        else:
+            self._perform_eplb_reshuffle()
+            if not self._can_reuse_moe_kernel():
+                self.warm_and_capture()
         if is_existing_worker:
             self._start_group_cleanup(retired_groups)
 
@@ -619,7 +599,8 @@ class ElasticEPScalingExecutor:
             self.switch_and_remove()
         else:
             retired_groups = self.switch_and_prepare()
-            self.warm_and_capture()
+            if not self._can_reuse_moe_kernel():
+                self.warm_and_capture()
             self._start_group_cleanup(retired_groups)
 
     def perform_scale_down_eplb_reshuffle(self, new_dp_size: int) -> None:
@@ -681,38 +662,18 @@ class ElasticEPScalingExecutor:
     def receive_expert_mapping(self) -> torch.Tensor:
         dp_group = get_dp_group()
         assert isinstance(dp_group, StatelessGroupCoordinator)
-        physical_to_logical, num_local_physical_experts, _ = broadcast_expert_mapping(
+        return broadcast_expert_mapping(
             physical_to_logical=None,
-            num_local_physical_experts=None,
-            num_logical_experts=None,
             dp_group=dp_group,
             src_rank=0,
             device=self.worker.device,
         )
-        num_moe_layers = physical_to_logical.shape[0]
-        new_dp_size = get_dp_group().world_size
-        tp_size = self.worker.vllm_config.parallel_config.tensor_parallel_size
-        new_ep_size = new_dp_size * tp_size
-        expanded_physical_to_logical = torch.full(
-            (num_moe_layers, num_local_physical_experts * new_ep_size),
-            -1,
-            dtype=physical_to_logical.dtype,
-            device=physical_to_logical.device,
-        )
-        expanded_physical_to_logical[:, : physical_to_logical.shape[1]] = (
-            physical_to_logical
-        )
-        return expanded_physical_to_logical
 
     def warmup_local_kernels(self) -> None:
         with set_current_vllm_config(self.worker.vllm_config):
             kernel_warmup(self.worker, process_local_only=True)
 
     def warm_and_capture(self) -> None:
-        # Must run on every DP sibling in lockstep: _dummy_run calls
-        # coordinate_batch_across_dp whenever data_parallel_size > 1
-        # (gpu_model_runner.py:3663), which deadlocks if any rank skips it.
-
         # Save and clear block tables so the dummy MoE forward doesn't
         # write dummy slot mappings into real KV-cache blocks.
         multi_block_table = self.worker.model_runner.input_batch.block_table
@@ -735,8 +696,11 @@ class ElasticEPScalingExecutor:
         # directly with skip_eplb=True so dummy routing doesn't pollute the
         # just-rebalanced EPLB stats.
         runner = self.worker.model_runner
-        runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
-        self.worker.compile_or_warm_up_model()
+        all2all_manager = get_ep_all2all_manager()
+        with runner.skip_dp_coordination(), all2all_manager.mask_remote_ranks():
+            runner._dummy_run(runner.max_num_tokens, is_profile=True, skip_eplb=True)
+            torch.accelerator.synchronize()
+            self.worker.compile_or_warm_up_model()
 
         lock_workspace()
 

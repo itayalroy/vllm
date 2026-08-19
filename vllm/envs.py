@@ -308,6 +308,7 @@ if TYPE_CHECKING:
     making the server model-name agnostic. Useful for proxy/gateway scenarios."""
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE: bool = False
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
@@ -2089,6 +2090,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
     ),
+    # Force Elastic EP to recapture CUDA graphs for debugging.
+    "VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE": lambda: bool(
+        int(os.getenv("VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE", "0"))
+    ),
     # If set to 1, enable CUDA graph memory estimation during memory profiling.
     # This profiles CUDA graph memory usage to provide more accurate KV cache
     # memory allocation. Enabled by default as of v0.21.0
@@ -2227,6 +2232,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
         "VLLM_DEBUG_DUMP_PATH",
+        "VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
