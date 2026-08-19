@@ -514,6 +514,7 @@ class GPUModelRunner(
         self.lora_config = vllm_config.lora_config
         self.load_config = vllm_config.load_config
         self.parallel_config = vllm_config.parallel_config
+        self._skip_dp_coordination = False
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
@@ -4051,6 +4052,15 @@ class GPUModelRunner(
                     return False
         return True
 
+    @contextmanager
+    def skip_dp_coordination(self):
+        previous = self._skip_dp_coordination
+        self._skip_dp_coordination = True
+        try:
+            yield
+        finally:
+            self._skip_dp_coordination = previous
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4124,16 +4134,26 @@ class GPUModelRunner(
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
-                    num_tokens_unpadded=num_tokens,
-                    parallel_config=self.parallel_config,
-                    allow_microbatching=allow_microbatching,
-                    num_tokens_padded=num_tokens_padded,
-                    uniform_decode=uniform_decode,
-                    cudagraph_mode=cudagraph_mode.value,
+            if self._skip_dp_coordination and (
+                not allow_microbatching or not self.parallel_config.use_ubatching
+            ):
+                num_tokens_across_dp = torch.full(
+                    (self.parallel_config.data_parallel_size,),
+                    num_tokens_padded,
+                    dtype=torch.int32,
                 )
-            )
+                synced_cudagraph_mode = cudagraph_mode.value
+            else:
+                should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                    coordinate_batch_across_dp(
+                        num_tokens_unpadded=num_tokens,
+                        parallel_config=self.parallel_config,
+                        allow_microbatching=allow_microbatching,
+                        num_tokens_padded=num_tokens_padded,
+                        uniform_decode=uniform_decode,
+                        cudagraph_mode=cudagraph_mode.value,
+                    )
+                )
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:

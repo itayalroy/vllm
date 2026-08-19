@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -474,6 +476,7 @@ class NixlEPAll2AllManager(All2AllManagerBase):
 
         for rank in range(state.active_ep_size, target_ep_size):
             state.buffer.update_mask_buffer(rank, mask=False)
+        torch.accelerator.synchronize()
         state.active_ep_size = target_ep_size
 
     def _stage_ep_size(self) -> None:
@@ -485,6 +488,10 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         # Scale-down must not disconnect active ranks until commit.
         if target_ep_size > state.connected_ep_size:
             self._connect_to_ep_size(target_ep_size, make_active=False)
+
+    def stage_ep_size(self) -> None:
+        with NixlEPAll2AllManager._lock:
+            self._stage_ep_size()
 
     def commit_staged_state(self) -> None:
         """Commit staged NIXL EP state to the active communication set."""
@@ -499,6 +506,21 @@ class NixlEPAll2AllManager(All2AllManagerBase):
                 self._connect_to_ep_size(target_ep_size, make_active=True)
 
             self._unmask_connected_ranks(target_ep_size)
+
+    @contextmanager
+    def mask_remote_ranks(self) -> Iterator[None]:
+        peers = [rank for rank in range(self.world_size) if rank != self.rank]
+        assert NixlEPAll2AllManager._buffer is not None
+        buffer = NixlEPAll2AllManager._buffer.buffer
+        for rank in peers:
+            buffer.update_mask_buffer(rank, mask=True)
+        torch.accelerator.synchronize()
+        try:
+            yield
+        finally:
+            for rank in peers:
+                buffer.update_mask_buffer(rank, mask=False)
+            torch.accelerator.synchronize()
 
     def _ensure_ep_size(self, *, stage: bool) -> None:
         if stage:
