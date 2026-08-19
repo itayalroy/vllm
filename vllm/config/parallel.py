@@ -214,6 +214,8 @@ class ParallelConfig:
 
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
+    elastic_ep_max_dp_size: int = Field(default=None, ge=1)  # type: ignore[assignment]
+    """Maximum data parallel size supported by elastic expert parallelism."""
 
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
@@ -933,6 +935,18 @@ class ParallelConfig:
                     "Offline data parallel mode is not supported/useful"
                     " for dense models."
                 )
+
+        max_dp_size = self.elastic_ep_max_dp_size
+        self.elastic_ep_max_dp_size = (
+            max_dp_size
+            if self.enable_elastic_ep and max_dp_size is not None
+            else self.data_parallel_size
+        )
+        if self.elastic_ep_max_dp_size < self.data_parallel_size:
+            raise ValueError(
+                "--elastic-ep-max-dp-size must be greater than or equal to "
+                f"the initial data_parallel_size ({self.data_parallel_size})."
+            )
 
         self.data_parallel_index = self.data_parallel_rank
 

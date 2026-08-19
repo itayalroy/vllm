@@ -11,6 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.elastic_ep.elastic_execute import can_reuse_cuda_graphs
 from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -205,6 +206,8 @@ class ElasticEPScalingState:
 
         elif state == ScaleUpNewEngineState.PREPARE:
             self._collective_rpc("elastic_ep_execute", args=("warmup_local_kernels",))
+            if can_reuse_cuda_graphs(self.vllm_config.parallel_config):
+                self._collective_rpc("elastic_ep_execute", args=("warm_and_capture",))
             self._mark_ready_for_switch()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
             torch.distributed.all_reduce(
