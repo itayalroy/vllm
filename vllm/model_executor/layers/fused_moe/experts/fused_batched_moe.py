@@ -11,6 +11,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
+    persistent_masked_m_silu_mul_quant,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe import try_get_optimal_moe_config
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -34,6 +37,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton, use_tensor_descriptor
 from vllm.triton_utils.allocation import set_triton_allocator
+from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
 
 
 def _is_capturing_or_compiling() -> bool:
@@ -971,8 +975,15 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             workspace2, (E, max_num_tokens, activation_out_dim)
         )
 
+        use_masked_silu_quant = (
+            activation == MoEActivation.SILU
+            and self.quant_config.use_fp8_w8a8
+            and self.block_shape == [128, 128]
+            and a2_scale is None
+        )
+
         # TODO(bnell): should this be done for any quantized type?
-        if self.quant_config.use_fp8_w8a8:
+        if self.quant_config.use_fp8_w8a8 and not use_masked_silu_quant:
             intermediate_cache1.fill_(0)
 
         a1q_scale = normalize_batched_scales_shape(a1q_scale, E)
@@ -995,26 +1006,33 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        intermediate_cache2.fill_(0)
+        if use_masked_silu_quant:
+            qintermediate_cache2, a2q_scale = persistent_masked_m_silu_mul_quant(
+                intermediate_cache1,
+                expert_num_tokens,
+                quant_scale_fmt=DeepGemmQuantScaleFMT.FLOAT32,
+            )
+        else:
+            intermediate_cache2.fill_(0)
 
-        # TODO (bnell): use triton utility from batched deep gemm.
-        self.activation(
-            activation,
-            intermediate_cache2.view(-1, activation_out_dim),
-            intermediate_cache1.view(-1, N),
-        )
+            # TODO (bnell): use triton utility from batched deep gemm.
+            self.activation(
+                activation,
+                intermediate_cache2.view(-1, activation_out_dim),
+                intermediate_cache1.view(-1, N),
+            )
 
-        qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
-            intermediate_cache2,
-            a2_scale,
-            max_num_tokens,
-            E,
-            N,
-            expert_num_tokens,
-            self.quant_dtype,
-            self.per_act_token_quant,
-            self.block_shape,
-        )
+            qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
+                intermediate_cache2,
+                a2_scale,
+                max_num_tokens,
+                E,
+                N,
+                expert_num_tokens,
+                self.quant_dtype,
+                self.per_act_token_quant,
+                self.block_shape,
+            )
 
         invoke_moe_batched_triton_kernel(
             A=qintermediate_cache2,
