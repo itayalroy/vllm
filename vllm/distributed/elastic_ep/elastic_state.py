@@ -11,6 +11,7 @@ from vllm.config import ParallelConfig
 from vllm.distributed import (
     stateless_destroy_torch_distributed_process_group,
 )
+from vllm.distributed.elastic_ep.debug import activate, trace_event, trace_phase
 from vllm.distributed.utils import get_cached_tcp_store_client
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -83,6 +84,13 @@ class ElasticEPScalingState:
         self.scale_type = scale_type
         self.reconfig_request = reconfig_request
         self.commit_requested = False
+        activate(
+            component="engine_core",
+            dp_rank=engine_core.dp_rank,
+            worker_type=worker_type,
+            scale_type=scale_type,
+            target_dp=new_parallel_config.data_parallel_size,
+        )
         self._prepare_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ElasticEPPrepare"
         )
@@ -121,6 +129,12 @@ class ElasticEPScalingState:
 
     def _execute_async(self, execute_method: str, *args) -> bool:
         if self._prepare_future is None:
+            trace_event(
+                "prepare_rpc_submit",
+                method=execute_method,
+                state=self.state,
+                worker_type=self.worker_type,
+            )
             done_keys = self._collective_rpc(
                 "elastic_ep_execute",
                 args=("start_async", execute_method, *args),
@@ -137,6 +151,12 @@ class ElasticEPScalingState:
             return False
 
         self._prepare_future.result()
+        trace_event(
+            "prepare_rpc_done",
+            method=execute_method,
+            state=self.state,
+            worker_type=self.worker_type,
+        )
         self._collective_rpc("elastic_ep_execute", args=("clear_async",))
         self._prepare_future = None
         return True
@@ -284,6 +304,12 @@ class ElasticEPScalingState:
             parallel_config.data_parallel_master_ip,
             parallel_config._coord_store_port,
         ).set(self.ready_key, b"1")
+        trace_phase(
+            "ready_for_commit",
+            "published",
+            dp_rank=self.engine_core.dp_rank,
+            worker_type=self.worker_type,
+        )
 
     def is_complete(self) -> bool:
         if self.scale_type == "scale_up":
@@ -306,6 +332,7 @@ class ElasticEPScalingState:
             return True
 
         if self._prepare_future is None:
+            trace_event("new_dp_group_submit", worker_type=self.worker_type)
             self._prepare_future = self._prepare_executor.submit(
                 self._init_new_dp_group
             )
@@ -313,6 +340,7 @@ class ElasticEPScalingState:
             return False
 
         self.new_dp_group, self.new_dp_store = self._prepare_future.result()
+        trace_event("new_dp_group_done", worker_type=self.worker_type)
         self._prepare_future = None
         return True
 
@@ -326,6 +354,12 @@ class ElasticEPScalingState:
             self.new_parallel_config.use_all2all,
         ):
             return False
+        trace_phase(
+            "worker_prepare",
+            "observed_complete",
+            dp_rank=self.engine_core.dp_rank,
+            worker_type=self.worker_type,
+        )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Prepared reconfiguration")
         return True
@@ -335,6 +369,12 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None and self.old_dp_group is not None
 
         if self._new_dp_sync is None:
+            trace_phase(
+                "kv_cache_sync",
+                "begin",
+                dp_rank=self.engine_core.dp_rank,
+                worker_type=self.worker_type,
+            )
             tensor = torch.tensor(
                 [self.engine_core.available_gpu_memory_for_kv_cache],
                 dtype=torch.int64,
@@ -354,6 +394,12 @@ class ElasticEPScalingState:
             return False
         work.wait()
         self._new_dp_sync = None
+        trace_phase(
+            "kv_cache_sync",
+            "end",
+            dp_rank=self.engine_core.dp_rank,
+            worker_type=self.worker_type,
+        )
         if self.old_dp_group.rank() == 0:
             logger.info("[Elastic EP] Synced KV cache memory size to new workers")
         return True

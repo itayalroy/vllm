@@ -493,6 +493,15 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         with NixlEPAll2AllManager._lock:
             self._stage_ep_size()
 
+    def debug_topology_state(self) -> dict[str, int]:
+        state = NixlEPAll2AllManager._buffer
+        assert state is not None
+        return {
+            "manager_ep_size": self.world_size,
+            "connected_ep_size": state.connected_ep_size,
+            "active_ep_size": state.active_ep_size,
+        }
+
     def commit_staged_state(self) -> None:
         """Commit staged NIXL EP state to the active communication set."""
         with NixlEPAll2AllManager._lock:

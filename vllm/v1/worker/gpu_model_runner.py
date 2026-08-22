@@ -39,7 +39,12 @@ from vllm.config import (
 from vllm.config.cache import CacheConfig
 from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
+from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+from vllm.distributed.elastic_ep.debug import (
+    dump_forward_history,
+    record_forward,
+)
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
@@ -350,8 +355,24 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         This function blocks until the copy is finished.
         """
+        generation = getattr(self, "_eep_debug_generation", -1)
+        dp_rank = getattr(self, "_eep_debug_dp_rank", -1)
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        try:
+            self.async_copy_ready_event.synchronize()
+        except BaseException as error:
+            dump_forward_history(
+                "output_wait_error",
+                dp_rank=dp_rank,
+                generation=generation,
+                error=repr(error),
+            )
+            raise
+        record_forward(
+            "worker_output_ready",
+            dp_rank=dp_rank,
+            generation=generation,
+        )
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -388,13 +409,31 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         del self._num_nans
 
         if self._has_fault is not None and self._has_fault.item():
-            mask = get_ep_all2all_manager().query_active_mask()
+            all2all_manager = get_ep_all2all_manager()
+            mask = all2all_manager.query_active_mask()
+            topology_state = (
+                all2all_manager.debug_topology_state()
+                if isinstance(all2all_manager, NixlEPAll2AllManager)
+                else {}
+            )
+            dump_forward_history(
+                "ep_fault",
+                dp_rank=dp_rank,
+                generation=generation,
+                mask=mask.cpu().tolist(),
+                **topology_state,
+            )
             raise RuntimeError(
                 "Fault detected in EP all2all communication: "
                 "one or more ranks timed out during dispatch/combine. "
                 f"Mask: {mask.cpu().tolist()}"
             )
 
+        record_forward(
+            "worker_forward_complete",
+            dp_rank=dp_rank,
+            generation=generation,
+        )
         return output
 
 

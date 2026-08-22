@@ -26,6 +26,13 @@ from vllm.distributed import (
     get_tp_group,
 )
 from vllm.distributed.device_communicators.all2all import NixlEPAll2AllManager
+from vllm.distributed.elastic_ep.debug import (
+    activate,
+    hold_after_phase,
+    trace_event,
+    trace_phase,
+    trace_phase_context,
+)
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
@@ -195,6 +202,13 @@ class ElasticEPScalingExecutor:
     def _run_async(self, execute_method: str, *args, **kwargs) -> None:
         from vllm.platforms import current_platform
 
+        parallel_config = self.worker.vllm_config.parallel_config
+        activate(
+            component="worker",
+            method=execute_method,
+            dp_rank=parallel_config.data_parallel_rank,
+            worker_rank=self.worker.rank,
+        )
         self.worker.vllm_config.enable_trace_function_call_for_thread()
         assert hasattr(self.worker, "device")
         current_platform.set_device(self.worker.device)
@@ -259,24 +273,74 @@ class ElasticEPScalingExecutor:
         parallel_config = self.worker.vllm_config.parallel_config
         world_size = parallel_config.world_size
         new_world_size_across_dp = world_size * new_dp_size
-        create_standby_groups(
-            new_dp_size=new_dp_size,
-            new_world_size_across_dp=new_world_size_across_dp,
-            master_ip=reconfig_request.new_data_parallel_master_ip,
-            coord_store_port=reconfig_request.coord_store_port,
-            use_all2all=use_all2all,
-            enable_eplb=parallel_config.enable_eplb,
-        )
+        debug_fields = {
+            "dp_rank": parallel_config.data_parallel_rank,
+            "worker_rank": self.worker.rank,
+            "old_dp_size": old_dp_size,
+            "new_dp_size": new_dp_size,
+        }
+        with trace_phase_context("standby_groups", **debug_fields):
+            create_standby_groups(
+                new_dp_size=new_dp_size,
+                new_world_size_across_dp=new_world_size_across_dp,
+                master_ip=reconfig_request.new_data_parallel_master_ip,
+                coord_store_port=reconfig_request.coord_store_port,
+                use_all2all=use_all2all,
+                enable_eplb=parallel_config.enable_eplb,
+            )
         if self._can_reuse_cuda_graphs():
             all2all_manager = get_ep_all2all_manager(eep_stage=True)
             assert isinstance(all2all_manager, NixlEPAll2AllManager)
-            all2all_manager.stage_ep_size()
+            with trace_phase_context("ep_connect", **debug_fields):
+                all2all_manager.stage_ep_size()
+            trace_event(
+                "ep_connect_state",
+                **debug_fields,
+                **all2all_manager.debug_topology_state(),
+            )
+            hold_after_phase(
+                "ep_connect",
+                reconfig_request,
+                old_dp_size,
+                world_size,
+                parallel_config.data_parallel_rank,
+                self.worker.rank,
+            )
         else:
             self.stage_standby_moe_quant_methods()
-        self._prepare_eplb_communicator(get_standby_eplb_group())
+        with trace_phase_context("eplb_communicator", **debug_fields):
+            self._prepare_eplb_communicator(get_standby_eplb_group())
+        hold_after_phase(
+            "eplb_communicator",
+            reconfig_request,
+            old_dp_size,
+            world_size,
+            parallel_config.data_parallel_rank,
+            self.worker.rank,
+        )
         if new_dp_size > old_dp_size:
-            self.transfer_weights(old_dp_size, new_dp_size)
-        self._warm_target_groups(get_standby_dp_group(), get_standby_ep_group())
+            with trace_phase_context("weight_transfer", **debug_fields):
+                self.transfer_weights(old_dp_size, new_dp_size)
+            hold_after_phase(
+                "weight_transfer",
+                reconfig_request,
+                old_dp_size,
+                world_size,
+                parallel_config.data_parallel_rank,
+                self.worker.rank,
+            )
+        self._warm_target_groups(
+            get_standby_dp_group(), get_standby_ep_group(), debug_fields
+        )
+        hold_after_phase(
+            "target_group_warmup",
+            reconfig_request,
+            old_dp_size,
+            world_size,
+            parallel_config.data_parallel_rank,
+            self.worker.rank,
+        )
+        trace_phase("worker_prepare", "returned", **debug_fields)
 
     def _prepare_eplb_communicator(self, eplb_group) -> None:
         assert eplb_group is not None
@@ -333,14 +397,19 @@ class ElasticEPScalingExecutor:
             )
         torch.accelerator.synchronize()
 
-    def _warm_target_groups(self, dp_group, ep_group) -> None:
+    def _warm_target_groups(self, dp_group, ep_group, debug_fields=None) -> None:
         assert dp_group is not None and ep_group is not None
+        debug_fields = debug_fields or {}
         stream = torch.Stream(device=dp_group.device)
         with stream:
             tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
-            for group in (dp_group, ep_group):
-                torch.distributed.all_reduce(tensor, group=group.device_group)
-                stream.synchronize()
+            for name, group in (
+                ("standby_dp_warmup", dp_group),
+                ("standby_ep_warmup", ep_group),
+            ):
+                with trace_phase_context(name, **debug_fields):
+                    torch.distributed.all_reduce(tensor, group=group.device_group)
+                    stream.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()

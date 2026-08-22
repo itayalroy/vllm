@@ -29,6 +29,11 @@ from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
 )
+from vllm.distributed.elastic_ep.debug import (
+    dump_forward_errors,
+    dump_forward_history,
+    record_forward,
+)
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -163,6 +168,8 @@ class Worker(WorkerBase):
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
+        self._eep_debug_forward_generation = 0
+        self._eep_debug_current_generation = -1
         self.worker_sentinel: WorkerSentinel | None = None
         if self.parallel_config.enable_fault_tolerance:
             self.worker_sentinel = WorkerSentinel(worker=self)
@@ -1046,13 +1053,32 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        output = self.model_runner.sample_tokens(grammar_output)
+        if isinstance(output, AsyncModelRunnerOutput):
+            output._eep_debug_generation = (  # type: ignore[attr-defined]
+                self._eep_debug_current_generation
+            )
+            output._eep_debug_dp_rank = (  # type: ignore[attr-defined]
+                self.parallel_config.data_parallel_rank
+            )
+        return output
 
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        self._eep_debug_forward_generation += 1
+        generation = self._eep_debug_forward_generation
+        self._eep_debug_current_generation = generation
+        record_forward(
+            "worker_forward_begin",
+            dp_rank=self.parallel_config.data_parallel_rank,
+            worker_rank=self.rank,
+            generation=generation,
+            tokens=scheduler_output.total_num_scheduled_tokens,
+            requests=len(scheduler_output.num_scheduled_tokens),
+        )
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
             for handle in self._pp_send_work:
@@ -1109,7 +1135,14 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        with (
+            self.annotate_profile(scheduler_output),
+            dump_forward_errors(
+                "execute_model_error",
+                dp_rank=self.parallel_config.data_parallel_rank,
+                generation=generation,
+            ),
+        ):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
@@ -1122,6 +1155,18 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                record_forward(
+                    "worker_forward_launched",
+                    dp_rank=self.parallel_config.data_parallel_rank,
+                    worker_rank=self.rank,
+                    generation=generation,
+                    output_type=type(output).__name__,
+                )
+                if isinstance(output, AsyncModelRunnerOutput):
+                    output._eep_debug_generation = generation  # type: ignore[attr-defined]
+                    output._eep_debug_dp_rank = (  # type: ignore[attr-defined]
+                        self.parallel_config.data_parallel_rank
+                    )
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1208,8 +1253,33 @@ class Worker(WorkerBase):
                     self.profiler = None
 
     def execute_dummy_batch(self) -> None:
+        self._eep_debug_forward_generation += 1
+        generation = self._eep_debug_forward_generation
+        self._eep_debug_current_generation = generation
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
-        self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        record_forward(
+            "worker_dummy_begin",
+            dp_rank=self.parallel_config.data_parallel_rank,
+            worker_rank=self.rank,
+            generation=generation,
+            tokens=num_tokens,
+        )
+        try:
+            self.model_runner._dummy_run(num_tokens, uniform_decode=True)
+        except BaseException as error:
+            dump_forward_history(
+                "dummy_forward_error",
+                dp_rank=self.parallel_config.data_parallel_rank,
+                generation=generation,
+                error=repr(error),
+            )
+            raise
+        record_forward(
+            "worker_dummy_complete",
+            dp_rank=self.parallel_config.data_parallel_rank,
+            worker_rank=self.rank,
+            generation=generation,
+        )
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.model_runner.add_lora(lora_request)
