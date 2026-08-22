@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.distributed.elastic_ep.debug import trace_phase_context
 from vllm.distributed.parallel_state import (
     _init_stateless_group,
     _node_count,
@@ -68,7 +69,8 @@ def create_standby_groups(
         use_device_communicator=False,
         coord_store=coord_store,
     )
-    _STANDBY_WORLD_NODE_COUNT = _node_count(_STANDBY_WORLD.tcp_store_group)
+    with trace_phase_context("standby_world_node_count"):
+        _STANDBY_WORLD_NODE_COUNT = _node_count(_STANDBY_WORLD.tcp_store_group)
 
     tp_size = get_tp_group().world_size
     pp_size = get_pp_group().world_size

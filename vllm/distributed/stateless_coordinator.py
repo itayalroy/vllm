@@ -28,6 +28,28 @@ logger = init_logger(__name__)
 _PORTS_FMT = "!3I"
 
 
+def _trace_group_stage(
+    group_name: str,
+    unique_name: str,
+    stage: str,
+    event: str,
+    group_index: int,
+    rank: int,
+    world_size: int,
+) -> None:
+    from vllm.distributed.elastic_ep.debug import trace_phase
+
+    trace_phase(
+        f"stateless_group_{stage}",
+        event,
+        group=group_name,
+        unique_name=unique_name,
+        group_index=group_index,
+        group_rank=rank,
+        group_size=world_size,
+    )
+
+
 def _allocate_group_ports(
     key: str,
     host: str,
@@ -112,6 +134,15 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 self.rank_in_group = ranks.index(self.rank)
 
                 key = f"{group_name}_{idx}"
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "ports",
+                    "begin",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
                 if self.rank_in_group == 0:
                     ports, socks = _allocate_group_ports(
                         key,
@@ -121,8 +152,26 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 else:
                     ports = _fetch_group_ports(key, coord_store)
                     socks = []
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "ports",
+                    "end",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
                 device_port, cpu_port, tcp_store_port = ports
 
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "device_pg",
+                    "begin",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
                 device_group = stateless_init_torch_distributed_process_group(
                     host=host,
                     port=device_port,
@@ -131,6 +180,24 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     backend=backend,
                     group_name=f"{self.unique_name}_device",
                     listen_socket=socks[0] if socks else None,
+                )
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "device_pg",
+                    "end",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "cpu_pg",
+                    "begin",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
                 )
                 cpu_group = stateless_init_torch_distributed_process_group(
                     host=host,
@@ -141,12 +208,39 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     group_name=f"{self.unique_name}_cpu",
                     listen_socket=socks[1] if socks else None,
                 )
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "cpu_pg",
+                    "end",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "tcp_store",
+                    "begin",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
+                )
                 tcp_store_group = StatelessProcessGroup.create(
                     host=host,
                     port=tcp_store_port,
                     rank=self.rank_in_group,
                     world_size=self.world_size,
                     listen_socket=socks[2] if socks else None,
+                )
+                _trace_group_stage(
+                    group_name,
+                    self.unique_name,
+                    "tcp_store",
+                    "end",
+                    idx,
+                    self.rank_in_group,
+                    self.world_size,
                 )
 
                 self_device_group = device_group
@@ -180,6 +274,15 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
+            _trace_group_stage(
+                group_name,
+                self.unique_name,
+                "device_communicator",
+                "begin",
+                idx,
+                self.rank_in_group,
+                self.world_size,
+            )
             device_comm_cls = resolve_obj_by_qualname(
                 current_platform.get_device_communicator_cls()
             )
@@ -193,6 +296,15 @@ class StatelessGroupCoordinator(GroupCoordinator):
                 global_world_size=global_world_size,
                 tcp_store_group=self.tcp_store_group,
                 use_all2all=use_all2all,
+            )
+            _trace_group_stage(
+                group_name,
+                self.unique_name,
+                "device_communicator",
+                "end",
+                idx,
+                self.rank_in_group,
+                self.world_size,
             )
 
         self.mq_broadcaster = None
