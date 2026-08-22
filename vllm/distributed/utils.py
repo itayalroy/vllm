@@ -619,6 +619,8 @@ def stateless_init_torch_distributed_process_group(
     pre-bound socket.  This is useful for eliminating TOCTOU races
     between port allocation and binding.
     """
+    from vllm.distributed.elastic_ep.debug import trace_phase_context
+
     init_method = get_tcp_uri(host, port)
     backend = Backend(backend)  # it is basically string
     timeout = _get_default_timeout(backend)
@@ -631,20 +633,28 @@ def stateless_init_torch_distributed_process_group(
         if device_timeout is not None:
             timeout = device_timeout
 
-    if listen_socket is not None:
-        store = create_tcp_store(
-            host,
-            port,
-            listen_socket=listen_socket,
-            world_size=world_size,
-            is_master=True,
-            timeout=timeout,
-            multi_tenant=True,
-        )
-    else:
-        store, rank, world_size = next(
-            rendezvous(init_method, rank, world_size, timeout=timeout)
-        )
+    trace_fields = dict(
+        backend=str(backend),
+        group=group_name or "anonymous",
+        group_rank=rank,
+        group_size=world_size,
+        store_role="server" if listen_socket is not None else "client",
+    )
+    with trace_phase_context("stateless_torch_pg_store", **trace_fields):
+        if listen_socket is not None:
+            store = create_tcp_store(
+                host,
+                port,
+                listen_socket=listen_socket,
+                world_size=world_size,
+                is_master=True,
+                timeout=timeout,
+                multi_tenant=True,
+            )
+        else:
+            store, rank, world_size = next(
+                rendezvous(init_method, rank, world_size, timeout=timeout)
+            )
     store.set_timeout(timeout)
 
     group_rank = rank
@@ -654,23 +664,24 @@ def stateless_init_torch_distributed_process_group(
     # different systems (e.g. RPC) in case the store is multi-tenant.
     prefix_store = PrefixStore(init_method, store)
 
-    if backend == "gloo":
-        pg = init_gloo_process_group(
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
-    else:
-        from vllm.platforms import current_platform
+    with trace_phase_context("stateless_torch_pg_backend", **trace_fields):
+        if backend == "gloo":
+            pg = init_gloo_process_group(
+                prefix_store=prefix_store,
+                group_rank=group_rank,
+                group_size=group_size,
+                timeout=timeout,
+            )
+        else:
+            from vllm.platforms import current_platform
 
-        pg = current_platform.stateless_init_device_torch_dist_pg(
-            backend=backend,
-            prefix_store=prefix_store,
-            group_rank=group_rank,
-            group_size=group_size,
-            timeout=timeout,
-        )
+            pg = current_platform.stateless_init_device_torch_dist_pg(
+                backend=backend,
+                prefix_store=prefix_store,
+                group_rank=group_rank,
+                group_size=group_size,
+                timeout=timeout,
+            )
 
     if group_name is not None:
         from torch._C._distributed_c10d import _register_process_group
