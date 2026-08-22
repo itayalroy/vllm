@@ -408,8 +408,10 @@ class ElasticEPScalingExecutor:
                 ("standby_ep_warmup", ep_group),
             ):
                 with trace_phase_context(name, **debug_fields):
-                    torch.distributed.all_reduce(tensor, group=group.device_group)
-                    stream.synchronize()
+                    with trace_phase_context(f"{name}_submit", **debug_fields):
+                        torch.distributed.all_reduce(tensor, group=group.device_group)
+                    with trace_phase_context(f"{name}_stream_sync", **debug_fields):
+                        stream.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
