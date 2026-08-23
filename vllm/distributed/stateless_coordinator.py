@@ -102,6 +102,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         global_rank: int = 0,
         global_world_size: int = 1,
         use_all2all: bool = False,
+        device_id: torch.device | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -180,6 +181,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     backend=backend,
                     group_name=f"{self.unique_name}_device",
                     listen_socket=socks[0] if socks else None,
+                    device_id=device_id,
                 )
                 _trace_group_stage(
                     group_name,

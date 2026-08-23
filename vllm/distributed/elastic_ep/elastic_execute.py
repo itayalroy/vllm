@@ -329,17 +329,6 @@ class ElasticEPScalingExecutor:
                 parallel_config.data_parallel_rank,
                 self.worker.rank,
             )
-        self._warm_target_groups(
-            get_standby_dp_group(), get_standby_ep_group(), debug_fields
-        )
-        hold_after_phase(
-            "target_group_warmup",
-            reconfig_request,
-            old_dp_size,
-            world_size,
-            parallel_config.data_parallel_rank,
-            self.worker.rank,
-        )
         trace_phase("worker_prepare", "returned", **debug_fields)
 
     def _prepare_eplb_communicator(self, eplb_group) -> None:
@@ -396,22 +385,6 @@ class ElasticEPScalingExecutor:
                 expert_weights=model.expert_weights,
             )
         torch.accelerator.synchronize()
-
-    def _warm_target_groups(self, dp_group, ep_group, debug_fields=None) -> None:
-        assert dp_group is not None and ep_group is not None
-        debug_fields = debug_fields or {}
-        stream = torch.Stream(device=dp_group.device)
-        with stream:
-            tensor = torch.zeros(1, dtype=torch.int32, device=dp_group.device)
-            for name, group in (
-                ("standby_dp_warmup", dp_group),
-                ("standby_ep_warmup", ep_group),
-            ):
-                with trace_phase_context(name, **debug_fields):
-                    with trace_phase_context(f"{name}_submit", **debug_fields):
-                        torch.distributed.all_reduce(tensor, group=group.device_group)
-                    with trace_phase_context(f"{name}_stream_sync", **debug_fields):
-                        stream.synchronize()
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -749,7 +722,6 @@ class ElasticEPScalingExecutor:
             expert_weights=expert_weights,
         )
         torch.accelerator.synchronize()
-        self._warm_target_groups(get_dp_group(), get_ep_group())
 
     def receive_expert_mapping(self) -> torch.Tensor:
         dp_group = get_dp_group()
