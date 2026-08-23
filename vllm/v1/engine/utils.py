@@ -831,13 +831,9 @@ class CoreEngineActorManager:
 
                 rank = old_dp_size + num_pg_created
 
-                # Create bundles with node constraint for master node
-                if node_ip == dp_master_ip:
-                    bundles = [
-                        {device_str: 1.0, "node:" + dp_master_ip: 0.001}
-                    ] * world_size + [{"CPU": 1.0}]
-                else:
-                    bundles = [{device_str: 1.0}] * world_size + [{"CPU": 1.0}]
+                bundles = [{device_str: 1.0, "node:" + node_ip: 0.001}] * world_size + [
+                    {"CPU": 1.0}
+                ]
 
                 pg = ray.util.placement_group(
                     name=f"dp_rank_{rank}",
