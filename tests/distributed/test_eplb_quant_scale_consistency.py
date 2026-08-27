@@ -72,6 +72,7 @@ def _make_moe_config(backend: str) -> FusedMoEConfig:
         use_ep=True,
         all2all_backend="allgather_reducescatter",
         enable_eplb=True,
+        max_dp_size=1,
     )
     return FusedMoEConfig(
         num_experts=NUM_EXPERTS,
