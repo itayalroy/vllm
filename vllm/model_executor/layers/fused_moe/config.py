@@ -1051,6 +1051,7 @@ class FusedMoEParallelConfig:
     use_ep: bool  # whether to use EP or not
     all2all_backend: str  # all2all backend for MoE communication
     enable_eplb: bool  # whether to enable expert load balancing
+    max_dp_size: int | None = None
 
     @property
     def is_sequence_parallel(self) -> bool:
@@ -1221,6 +1222,7 @@ class FusedMoEParallelConfig:
         tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
             tp_size_, dp_size_, dp_rank, pcp_size_, pcp_rank
         )
+        max_dp_size = vllm_parallel_config.elastic_ep_max_dp_size
 
         if not use_ep:
             return FusedMoEParallelConfig(
@@ -1236,6 +1238,7 @@ class FusedMoEParallelConfig:
                 use_ep=False,
                 all2all_backend=vllm_parallel_config.all2all_backend,
                 enable_eplb=vllm_parallel_config.enable_eplb,
+                max_dp_size=max_dp_size,
             )
         # DP + EP / TP + EP / DP + TP + EP
         assert use_ep
@@ -1256,6 +1259,7 @@ class FusedMoEParallelConfig:
             use_ep=True,
             all2all_backend=vllm_parallel_config.all2all_backend,
             enable_eplb=vllm_parallel_config.enable_eplb,
+            max_dp_size=max_dp_size,
         )
 
     @classmethod
@@ -1274,6 +1278,7 @@ class FusedMoEParallelConfig:
             use_ep=False,
             all2all_backend="allgather_reducescatter",
             enable_eplb=False,
+            max_dp_size=1,
         )
 
 

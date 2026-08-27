@@ -500,7 +500,9 @@ def fi_moe_largest_bucket(moe_config: "FusedMoEConfig") -> int:
 
     For a detailed explanation, see: `docs/serving/data_parallel_deployment.md`
     """
-    return max(moe_config.max_num_tokens * moe_config.dp_size, 8192)
+    parallel_config = moe_config.moe_parallel_config
+    max_dp_size = parallel_config.max_dp_size or parallel_config.dp_size
+    return max(moe_config.max_num_tokens * max_dp_size, 8192)
 
 
 def trtllm_moe_pack_topk_ids_weights(
