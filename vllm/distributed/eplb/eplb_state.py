@@ -925,6 +925,7 @@ class EplbState:
                         _commit_eplb_maps(
                             eplb_model_state,
                             new_physical_to_logical_map=new_physical_to_logical_map,
+                            preserve_capacity=rank_mapping is not None,
                         )
 
                 if is_main_rank:
@@ -1350,6 +1351,7 @@ def _commit_eplb_maps_for_layer(
 def _commit_eplb_maps(
     model_state: EplbModelState,
     new_physical_to_logical_map: torch.Tensor,
+    preserve_capacity: bool = False,
 ) -> None:
     """
     Copies all of the new_* maps into model_state. After this function completes,
@@ -1361,9 +1363,12 @@ def _commit_eplb_maps(
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map
 
-    resize = src.shape[1] > dst.shape[1] or (
-        src.shape[1] < dst.shape[1]
-        and dst.shape[1] == model_state.model.num_physical_experts
+    resize = not preserve_capacity and (
+        src.shape[1] > dst.shape[1]
+        or (
+            src.shape[1] < dst.shape[1]
+            and dst.shape[1] == model_state.model.num_physical_experts
+        )
     )
     if resize:
         model_state.physical_to_logical_map = src.to(dst.device)
