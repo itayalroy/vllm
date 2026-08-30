@@ -1121,6 +1121,21 @@ class EplbState:
         eplb_model_state.logical_to_physical_map.copy_(logical_to_physical_map)
         eplb_model_state.logical_replica_count.copy_(logical_replica_count)
 
+    def reconfigure_physical_expert_slots(
+        self,
+        model_config: ModelConfig,
+        num_physical_experts: int,
+    ) -> None:
+        model_state = self.model_states[model_config.compute_hash()]
+        old_num_physical_experts = model_state.model.num_physical_experts
+        first_slot = min(old_num_physical_experts, num_physical_experts)
+        last_slot = max(old_num_physical_experts, num_physical_experts)
+        assert last_slot <= model_state.physical_to_logical_map.shape[1]
+        expert_slots = slice(first_slot, last_slot)
+        model_state.physical_to_logical_map[:, expert_slots].fill_(-1)
+        model_state.expert_load_pass[:, expert_slots].zero_()
+        model_state.expert_load_window[..., expert_slots].zero_()
+
     def create_communicator(
         self, model_config: ModelConfig, group_coordinator: GroupCoordinator
     ) -> EplbCommunicator:

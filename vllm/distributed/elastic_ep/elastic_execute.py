@@ -438,9 +438,6 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
-        old_dp_size = get_dp_group().world_size
-        old_ep_size = get_ep_group().world_size
-
         if not self._can_reuse_cuda_graphs():
             self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
@@ -499,17 +496,7 @@ class ElasticEPScalingExecutor:
         parallel_config.eplb_config.num_redundant_experts = (
             num_physical_experts - num_logical_experts
         )
-        if new_dp_size > old_dp_size:
-            old_num_physical_experts = num_local_experts * old_ep_size
-            eplb_model_state.physical_to_logical_map[
-                :, old_num_physical_experts:num_physical_experts
-            ].fill_(-1)
-            eplb_model_state.expert_load_pass[
-                :, old_num_physical_experts:num_physical_experts
-            ].zero_()
-            eplb_model_state.expert_load_window[
-                :, :, old_num_physical_experts:num_physical_experts
-            ].zero_()
+        eplb_state.reconfigure_physical_expert_slots(model_config, num_physical_experts)
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
