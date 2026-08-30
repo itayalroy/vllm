@@ -405,6 +405,11 @@ class NixlEPAll2AllManager(All2AllManagerBase):
         super().__init__(cpu_group, tcp_store_group)
         self.support_fault_tolerance = True
 
+    @property
+    def max_num_ep_ranks(self) -> int:
+        assert NixlEPAll2AllManager._buffer is not None
+        return NixlEPAll2AllManager._buffer.max_num_ep_ranks
+
     def _init_buffer(
         self,
         max_num_tokens_per_dp_rank: int,
