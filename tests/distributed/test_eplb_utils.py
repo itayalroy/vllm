@@ -27,20 +27,22 @@ def _make_model_state(
 
 def test_commit_eplb_maps_shape_change():
     """
-    The normal path copies the physical_to_logical map in-place. When the number of
-    physical experts changes, the old map should be replaced entirely.
+    When the number of physical experts changes, resize the active map within its
+    preallocated storage.
     """
     num_layers, num_logical, num_physical = 2, 4, 6
     max_replicas = 3
 
     # Build current state tensors
+    storage = torch.full((num_layers, num_physical + 2), -1, dtype=torch.long)
     model_state = _make_model_state(
-        phy2log=torch.zeros(num_layers, num_physical, dtype=torch.long),
+        phy2log=storage[:, :num_physical],
         log2phy=torch.full(
             (num_layers, num_logical, max_replicas), -1, dtype=torch.long
         ),
         logcnt=torch.zeros(num_layers, num_logical, dtype=torch.long),
     )
+    model_state.physical_to_logical_map_storage = storage
 
     # The new map has two more physical experts. These new physical experts will
     # automatically map to the first two logical experts
@@ -54,6 +56,7 @@ def test_commit_eplb_maps_shape_change():
     # Check that the number of physical experts has been updated and that the values
     # match
     assert model_state.physical_to_logical_map.shape[1] == num_physical + 2
+    assert model_state.physical_to_logical_map.data_ptr() == storage.data_ptr()
     assert torch.equal(model_state.physical_to_logical_map, new_phy2log_larger)
 
 
