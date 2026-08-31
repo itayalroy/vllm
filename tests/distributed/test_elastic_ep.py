@@ -173,8 +173,6 @@ def _base_serve_args(
         "1",
         "--gpu-memory-utilization",
         "0.8",
-        "--max-model-len",
-        "4096",
         "--enable-expert-parallel",
         "--all2all-backend",
         all2all_backend,
@@ -260,6 +258,22 @@ def test_elastic_ep_scaling(
             f"Scale down accuracy {scale_down_accuracy:.3f} dropped more than "
             f"{ACCURACY_TOL} below initial accuracy {initial_accuracy:.3f}"
         )
+
+        repeat_cycles = int(os.getenv("VLLM_TEST_ELASTIC_EP_REPEAT_CYCLES", "1"))
+        for cycle in range(2, repeat_cycles + 1):
+            for source_dp_size, new_dp_size, direction in (
+                (initial_dp_size, target_dp_size, "up"),
+                (target_dp_size, initial_dp_size, "down"),
+            ):
+                _scale_with_traffic(server, source_dp_size, new_dp_size, traffic_mode)
+                accuracy = _run_gsm8k_eval(
+                    server, f"After cycle {cycle} scale {direction}"
+                )
+                assert accuracy >= initial_accuracy - ACCURACY_TOL, (
+                    f"Cycle {cycle} scale {direction} accuracy {accuracy:.3f} "
+                    f"dropped more than {ACCURACY_TOL} below initial accuracy "
+                    f"{initial_accuracy:.3f}"
+                )
 
         print("\nAccuracy Summary:")
         print(f"  Initial:    {initial_accuracy:.3f}")
