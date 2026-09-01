@@ -228,6 +228,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
+    is_last_ubatch_empty,
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
@@ -4004,9 +4005,6 @@ class GPUModelRunner(
 
     @contextmanager
     def skip_dp_coordination(self):
-        assert not self.parallel_config.use_ubatching, (
-            "Skipping DP coordination does not support u-batching."
-        )
         previous = self._skip_dp_coordination
         self._skip_dp_coordination = True
         try:
@@ -4088,6 +4086,23 @@ class GPUModelRunner(
         should_ubatch, num_tokens_across_dp = False, None
         if self.vllm_config.parallel_config.data_parallel_size > 1:
             if self._skip_dp_coordination:
+                should_ubatch = (
+                    allow_microbatching
+                    and check_ubatch_thresholds(
+                        self.parallel_config,
+                        num_tokens,
+                        uniform_decode=uniform_decode,
+                    )
+                    and not is_last_ubatch_empty(
+                        num_tokens,
+                        num_tokens_padded,
+                        self.parallel_config.num_ubatches,
+                    )
+                )
+                if should_ubatch:
+                    logger.info_once(
+                        "[DBO experiment] Using independent u-batch capture"
+                    )
                 num_tokens_across_dp = torch.full(
                     (self.parallel_config.data_parallel_size,),
                     num_tokens_padded,
@@ -4105,6 +4120,8 @@ class GPUModelRunner(
                         cudagraph_mode=cudagraph_mode.value,
                     )
                 )
+                if should_ubatch:
+                    logger.info_once("[DBO experiment] Using coordinated u-batching")
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:

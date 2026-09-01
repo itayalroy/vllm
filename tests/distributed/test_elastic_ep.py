@@ -205,6 +205,8 @@ def _base_serve_args(
         args.extend(["--data-parallel-address", leader_address])
     if enforce_eager:
         args.append("--enforce-eager")
+    if os.getenv("VLLM_TEST_ELASTIC_EP_ENABLE_DBO") == "1":
+        args.append("--enable-dbo")
 
     return args
 

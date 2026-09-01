@@ -72,7 +72,6 @@ if TYPE_CHECKING:
 def can_reuse_cuda_graphs(parallel_config: ParallelConfig) -> bool:
     return (
         parallel_config.all2all_backend == "nixl_ep"
-        and not parallel_config.use_ubatching
         and not envs.VLLM_ELASTIC_EP_DISABLE_CUDA_GRAPH_REUSE
     )
 
