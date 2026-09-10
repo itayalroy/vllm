@@ -56,6 +56,37 @@ def test_per_token_group_quant_fp8(
     assert torch.allclose(scale, ref_s, atol=0.01, rtol=0.01)
 
 
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="Only test on CUDA/ROCm.",
+)
+def test_masked_per_token_group_quant_fp8(use_ue8m0: bool, group_size: int):
+    device = current_platform.device_type
+    torch.manual_seed(42)
+    x = torch.randn((4, 37, 256), device=device, dtype=torch.bfloat16) * 8
+    counts = [0, 1, 17, 37]
+    valid_token_counts = torch.tensor(counts, device=device, dtype=torch.int32)
+
+    out_q, out_s = fp8_utils.masked_per_token_group_quant_fp8(
+        x, valid_token_counts, group_size, use_ue8m0=use_ue8m0
+    )
+
+    for expert, count in enumerate(counts):
+        if count == 0:
+            continue
+        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
+            x[expert, :count].contiguous(),
+            group_size,
+            use_ue8m0=use_ue8m0,
+        )
+        torch.testing.assert_close(
+            out_q[expert, :count].float(), ref_q.float(), atol=0.15, rtol=0.15
+        )
+        torch.testing.assert_close(out_s[expert, :count], ref_s, atol=0.01, rtol=0.01)
+
+
 @pytest.mark.parametrize(
     "num_tokens,hidden_dim,group_size",
     [

@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
     moe_kernel_quantize_input,
     normalize_batched_scales_shape,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    masked_per_token_group_quant_fp8,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     group_broadcast,
@@ -708,6 +711,19 @@ class NaiveBatchedExperts(mk.FusedMoEExpertsModular):
             output[expert, :num, :] = tmp @ w2_dq.transpose(0, 1).to(tmp.dtype)
 
 
+def _use_masked_fp8_block_quant(
+    A_scale: torch.Tensor | None,
+    qtype: torch.dtype | None,
+    block_shape: list[int] | None,
+) -> bool:
+    return (
+        current_platform.is_cuda_alike()
+        and qtype == current_platform.fp8_dtype()
+        and A_scale is None
+        and block_shape is not None
+    )
+
+
 def batched_moe_kernel_quantize_input(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,
@@ -719,15 +735,27 @@ def batched_moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if _use_masked_fp8_block_quant(A_scale, qtype, block_shape):
+        assert block_shape is not None
+        return masked_per_token_group_quant_fp8(
+            A,
+            expert_num_tokens,
+            block_shape[1],
+        )
+
     if _is_capturing_or_compiling():
-        # Note: this does a bunch of extra work because expert_num_tokens is
-        # ignored but it does support torch.compile + cudagraphs.
         hidden_dim = A.size(-1)
         assert A_scale is None or A_scale.ndim <= 2, (
             f"{A_scale.shape if A_scale is not None else None}"
         )
+        # This supports torch.compile and CUDA graphs, but quantizes the
+        # complete padded buffer.
         A_q, A_q_scale = moe_kernel_quantize_input(
-            A.view(-1, hidden_dim), A_scale, qtype, per_act_token_quant, block_shape
+            A.view(-1, hidden_dim),
+            A_scale,
+            qtype,
+            per_act_token_quant,
+            block_shape,
         )
         A_q = A_q.view(E, -1, hidden_dim)
         A_q_scale = normalize_batched_scales_shape(A_q_scale, E)
@@ -961,8 +989,14 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             workspace2, (E, max_num_tokens, activation_out_dim)
         )
 
+        masked_fp8_block_quant = _use_masked_fp8_block_quant(
+            a2_scale,
+            self.quant_dtype,
+            self.block_shape,
+        )
+
         # TODO(bnell): should this be done for any quantized type?
-        if self.quant_config.use_fp8_w8a8:
+        if self.quant_config.use_fp8_w8a8 and not masked_fp8_block_quant:
             intermediate_cache1.fill_(0)
 
         a1q_scale = normalize_batched_scales_shape(a1q_scale, E)
@@ -985,7 +1019,8 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        intermediate_cache2.fill_(0)
+        if not masked_fp8_block_quant:
+            intermediate_cache2.fill_(0)
 
         # TODO (bnell): use triton utility from batched deep gemm.
         if current_platform.is_xpu():

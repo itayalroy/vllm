@@ -138,6 +138,45 @@ def _per_token_group_quant_fp8(
 
 
 @triton.jit
+def _masked_per_token_group_quant_fp8(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    valid_token_counts_ptr,
+    max_num_tokens,
+    num_columns,
+    eps,
+    fp8_min: tl.constexpr,
+    fp8_max: tl.constexpr,
+    use_ue8m0: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_ROW: tl.constexpr,
+    TOKEN_BLOCKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    expert_group = tl.program_id(0)
+    token_block = tl.program_id(1)
+    expert = expert_group // GROUPS_PER_ROW
+    group = expert_group % GROUPS_PER_ROW
+    num_tokens = tl.minimum(
+        tl.maximum(tl.load(valid_token_counts_ptr + expert), 0), max_num_tokens
+    )
+    cols = tl.arange(0, BLOCK)
+    col_mask = cols < GROUP_SIZE
+
+    for token in tl.range(token_block, num_tokens, TOKEN_BLOCKS):
+        row = expert.to(tl.int64) * max_num_tokens + token
+        offsets = row * num_columns + group * GROUP_SIZE + cols
+        y = tl.load(y_ptr + offsets, mask=col_mask, other=0.0).to(tl.float32)
+        scale_raw = tl.maximum(tl.max(tl.abs(y)), eps) * (1.0 / fp8_max)
+        y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
+        y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+
+        tl.store(y_q_ptr + offsets, y_q, mask=col_mask)
+        tl.store(y_s_ptr + row * GROUPS_PER_ROW + group, y_s)
+
+
+@triton.jit
 def _silu_mul_quant_fp8_packed_kernel(
     input_ptr,
     output_q_ptr,
@@ -677,6 +716,56 @@ def per_token_group_quant_fp8(
             num_stages=num_stages,
         )
 
+    return x_q, x_s
+
+
+def masked_per_token_group_quant_fp8(
+    x: torch.Tensor,
+    valid_token_counts: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+    dtype: torch.dtype | None = None,
+    use_ue8m0: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the valid token prefix of each expert in ``[E, T, H]`` input."""
+    assert x.ndim == 3 and x.is_contiguous()
+    assert valid_token_counts.shape == (x.shape[0],)
+    assert valid_token_counts.dtype == torch.int32
+    assert valid_token_counts.device == x.device
+    assert valid_token_counts.is_contiguous()
+    assert x.shape[-1] % group_size == 0
+
+    dtype = current_platform.fp8_dtype() if dtype is None else dtype
+    use_ue8m0 = is_deep_gemm_e8m0_used() if use_ue8m0 is None else use_ue8m0
+    x_q = torch.empty_like(x, dtype=dtype)
+    groups_per_row = x.shape[-1] // group_size
+    x_s = torch.empty(
+        (*x.shape[:-1], groups_per_row), device=x.device, dtype=torch.float32
+    )
+    if x.numel() == 0:
+        return x_q, x_s
+
+    fp8_min, fp8_max = get_fp8_min_max()
+    token_blocks = min(x.shape[1], 32)
+    block = triton.next_power_of_2(group_size)
+    _masked_per_token_group_quant_fp8[(x.shape[0] * groups_per_row, token_blocks)](
+        x,
+        x_q,
+        x_s,
+        valid_token_counts,
+        x.shape[1],
+        x.shape[2],
+        eps,
+        fp8_min=fp8_min,
+        fp8_max=fp8_max,
+        use_ue8m0=use_ue8m0,
+        GROUP_SIZE=group_size,
+        GROUPS_PER_ROW=groups_per_row,
+        TOKEN_BLOCKS=token_blocks,
+        BLOCK=block,
+        num_warps=min(max(block // 256, 1), 8),
+        num_stages=1,
+    )
     return x_q, x_s
 
 
