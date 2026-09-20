@@ -7,9 +7,62 @@ import pytest
 import torch
 
 from vllm.distributed.eplb.eplb_state import (
+    EplbState,
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
+
+
+def test_expert_load_history_survives_reshuffle_and_scale_up(monkeypatch):
+    """Historical counts must follow experts, not their previous physical slots."""
+    module = "vllm.distributed.eplb.eplb_state"
+    group = MagicMock()
+    group.device_group.rank.return_value = 0
+    group.device_group.size.return_value = 1
+    monkeypatch.setattr(f"{module}.get_ep_group", lambda: group)
+    monkeypatch.setattr(f"{module}.get_node_count", lambda: 1)
+    storage = torch.tensor([[0, 1, -1, -1]])
+    ms = _make_model_state(
+        storage[:, :2], torch.full((1, 2, 3), -1), torch.ones((1, 2)), storage
+    )
+    ms.model.num_logical_experts = 2
+    ms.model.num_physical_experts = 2
+    ms.model.num_expert_groups = 1
+    ms.model.num_moe_layers = 1
+    ms.expert_load_pass_buffer = torch.zeros((1, 4), dtype=torch.int32)
+    ms.expert_load_pass = ms.expert_load_pass_buffer[:, :2]
+    ms.expert_load_window = torch.zeros((3, 1, 3), dtype=torch.int32)
+    state = object.__new__(EplbState)
+    state.model_states = {"model": ms}
+    state.is_async = False
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 100
+    state.expert_load_window_step = 0
+    state.expert_load_window_size = 3
+    state.should_record_tensor = None
+    state._should_record_current_step = lambda **kwargs: True
+    state._allreduce_list = lambda values: values
+    state.rearrange_event = MagicMock()
+
+    ms.expert_load_pass.copy_(torch.tensor([[100, 10]]))
+    state.step()
+    _commit_eplb_maps_for_layer(ms, torch.tensor([1, 0]), 0)
+    ms.expert_load_pass.copy_(torch.tensor([[20, 200]]))
+    state.step()
+
+    config = MagicMock()
+    config.compute_hash.return_value = "model"
+    state.reconfigure_physical_expert_slots(config, 4)
+    ms.model.num_physical_experts = 4
+    _commit_eplb_maps_for_layer(ms, torch.tensor([1, 0, 0, -1]), 0)
+    ms.expert_load_pass.copy_(torch.tensor([[30, 100, 200, 999]]))
+    state.step()
+    state.is_async = True
+    state.rearrange()
+
+    torch.testing.assert_close(
+        ms.eplb_stats.global_expert_load_window, torch.tensor([[600, 60]])
+    )
 
 
 def _make_model_state(
