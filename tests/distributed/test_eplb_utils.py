@@ -26,6 +26,7 @@ def _make_model_state(
     )
     state.logical_to_physical_map = log2phy
     state.logical_replica_count = logcnt
+    state.expert_load_window = torch.zeros((3, *phy2log.shape), dtype=torch.int32)
     return state
 
 
@@ -133,7 +134,7 @@ def test_commit_eplb_maps_for_layer():
     """Test that only the target layer is updated"""
     num_layers, num_logical, max_replicas = 2, 3, 2
 
-    original_phy2log = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
+    original_phy2log = torch.tensor([[0, 1, 2, 0], [2, 1, 0, 2]], dtype=torch.long)
     model_state = _make_model_state(
         phy2log=original_phy2log.clone(),
         log2phy=torch.full(
@@ -157,3 +158,59 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
+
+
+@pytest.mark.parametrize("per_layer", [False, True])
+def test_expert_load_history_survives_repeated_reshuffles(per_layer):
+    """Keep every sample's logical counts across moves and replica-count changes."""
+    num_logical = 3
+    storage = torch.full((2, 6), -1, dtype=torch.long)
+    storage[:, :4] = torch.tensor([[0, 1, 2, 0], [2, 0, 1, -1]])
+    state = _make_model_state(
+        storage[:, :4], torch.full((2, num_logical, 4), -1), torch.ones((2, 3)), storage
+    )
+    state.expert_load_window.copy_(torch.arange(24).reshape(3, 2, 4))
+
+    def logical_history():
+        return torch.stack(
+            [
+                (
+                    state.expert_load_window * (state.physical_to_logical_map == expert)
+                ).sum(dim=-1)
+                for expert in range(num_logical)
+            ],
+            dim=-1,
+        )
+
+    placements = [
+        [[2, 0, 1, 1], [1, 2, 0, -1]],
+        [[1, 0, 2, 1, 0, -1], [0, 2, 1, 2, 0, 1]],
+        [[2, 1, 0], [1, 0, 2]],
+        [[0, 2, 1, 0, 2, 1], [2, 1, 0, 1, 2, -1]],
+        [[1, 2, 0, 0], [0, 1, 2, 2]],
+    ]
+    for step, placement in enumerate(placements):
+        expected = logical_history()
+        mapping = torch.tensor(placement)
+        old_size = state.physical_to_logical_map.shape[1]
+        new_size = mapping.shape[1]
+        if per_layer and new_size >= old_size:
+            # Scale-up exposes inactive slots before async per-layer installation.
+            storage[:, old_size:new_size].fill_(-1)
+            state.physical_to_logical_map = storage[:, :new_size]
+            state.expert_load_window = torch.nn.functional.pad(
+                state.expert_load_window, (0, new_size - old_size)
+            )
+            for layer in range(2):
+                _commit_eplb_maps_for_layer(state, mapping[layer], layer)
+                torch.testing.assert_close(logical_history(), expected)
+        else:
+            # Scale-down installs the smaller placement before removing slots.
+            _commit_eplb_maps(state, mapping)
+        torch.testing.assert_close(logical_history(), expected)
+        assert state.expert_load_window.shape == (3, 2, new_size)
+        assert state.physical_to_logical_map.data_ptr() == storage.data_ptr()
+        # Replace one sample as recording resumes between reshuffles.
+        state.expert_load_window[step % 3].copy_(
+            torch.arange(2 * new_size).reshape(2, new_size) + step
+        )

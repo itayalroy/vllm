@@ -175,6 +175,9 @@ class EplbModelState:
 
     Shape: (window_size, num_moe_layers, num_physical_experts)
 
+    History is remapped when experts move, preserving each logical expert's
+    counts. Historical counts per replica do not represent its actual traffic.
+
     NOTE: The expert_load_view now records load for all physical experts
     rather than just local experts. This ensures consistent load statistics
     across different dispatch methods (naive all-to-all, DeepEP).
@@ -1323,6 +1326,32 @@ def _pad_out_tensor(src: torch.Tensor, dst: torch.Tensor) -> None:
         dst.copy_(new_src)
 
 
+def _rearrange_expert_load_window(
+    load_window: torch.Tensor,
+    old_physical_to_logical: torch.Tensor,
+    new_logical_to_physical: torch.Tensor,
+    num_physical_experts: int,
+) -> torch.Tensor:
+    """Preserve each sample's logical load under a new physical placement."""
+    # Keep each expert's history in its first new replica. A final, discarded
+    # column collects inactive slots, which have no logical expert.
+    first_replica = torch.nn.functional.pad(
+        new_logical_to_physical[..., 0], (0, 1), value=num_physical_experts
+    ).to(load_window.device, non_blocking=True)
+    num_logical_experts = new_logical_to_physical.shape[-2]
+    indices = first_replica.gather(
+        -1,
+        old_physical_to_logical.masked_fill(
+            old_physical_to_logical < 0, num_logical_experts
+        ),
+    )
+    remapped = load_window.new_zeros(
+        (*load_window.shape[:-1], num_physical_experts + 1)
+    )
+    remapped.scatter_add_(-1, indices.unsqueeze(0).expand_as(load_window), load_window)
+    return remapped[..., :-1]
+
+
 def _commit_eplb_maps_for_layer(
     model_state: EplbModelState,
     new_physical_to_logical_map: torch.Tensor,
@@ -1341,12 +1370,17 @@ def _commit_eplb_maps_for_layer(
         f"Current number of physical experts: {dst.shape[0]}. New number of physical "
         f"experts {src.shape[0]}."
     )
+    num_logical_experts = model_state.logical_to_physical_map.shape[1]
+    new_logical, new_replica_count = compute_logical_maps(src, num_logical_experts)
+    model_state.expert_load_window[:, layer].copy_(
+        _rearrange_expert_load_window(
+            model_state.expert_load_window[:, layer], dst, new_logical, src.shape[0]
+        )
+    )
     if PIN_MEMORY and src.is_cpu:
         src = src.new_empty(src.shape, pin_memory=True).copy_(src)
     dst.copy_(src, non_blocking=True)
 
-    num_logical_experts = model_state.logical_to_physical_map.shape[1]
-    new_logical, new_replica_count = compute_logical_maps(src, num_logical_experts)
     # Commit logical_to_physical_map
     _pad_out_tensor(src=new_logical, dst=model_state.logical_to_physical_map[layer])
 
@@ -1371,6 +1405,11 @@ def _commit_eplb_maps(
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map
 
+    num_logical_experts = model_state.logical_to_physical_map.shape[1]
+    new_logical, new_replica_count = compute_logical_maps(src, num_logical_experts)
+    model_state.expert_load_window = _rearrange_expert_load_window(
+        model_state.expert_load_window, dst, new_logical, src.shape[1]
+    )
     if PIN_MEMORY and src.is_cpu:
         src = src.new_empty(src.shape, pin_memory=True).copy_(src)
     # When the number of physical experts changes, refresh the active map view to
@@ -1381,8 +1420,6 @@ def _commit_eplb_maps(
         model_state.physical_to_logical_map = dst
     dst.copy_(src, non_blocking=True)
 
-    num_logical_experts = model_state.logical_to_physical_map.shape[1]
-    new_logical, new_replica_count = compute_logical_maps(src, num_logical_experts)
     # Commit logical_to_physical_map
     _pad_out_tensor(
         src=new_logical,
