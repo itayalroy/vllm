@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.distributed.eplb.eplb_state import (
+    EplbState,
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
@@ -26,6 +27,10 @@ def _make_model_state(
     )
     state.logical_to_physical_map = log2phy
     state.logical_replica_count = logcnt
+    state.expert_load_window = torch.zeros((3, *phy2log.shape), dtype=torch.int32)
+    state.expert_load_samples = 0
+    state.expert_load_valid_after = torch.zeros(phy2log.shape[0], dtype=torch.int64)
+    state.last_expert_load = None
     return state
 
 
@@ -157,3 +162,73 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
+
+
+@pytest.mark.parametrize("per_layer", [False, True])
+def test_rearrange_reuses_load_until_history_matches_mapping(monkeypatch, per_layer):
+    """Use saved demand until old samples are replaced, separately for each layer."""
+    module = "vllm.distributed.eplb.eplb_state"
+    group = MagicMock()
+    group.device_group.rank.return_value = 0
+    group.device_group.size.return_value = 1
+    monkeypatch.setattr(f"{module}.get_ep_group", lambda: group)
+    monkeypatch.setattr(f"{module}.get_node_count", lambda: 1)
+    ms = _make_model_state(
+        torch.tensor([[0, 1], [0, 1]]),
+        torch.full((2, 2, 1), -1),
+        torch.ones((2, 2)),
+    )
+    ms.model.num_logical_experts = 2
+    ms.model.num_physical_experts = 2
+    ms.model.num_expert_groups = 1
+    ms.model.num_moe_layers = 2
+    ms.expert_load_pass = torch.zeros((2, 2), dtype=torch.int32)
+    ms.expert_load_window[:] = torch.tensor([[10, 1], [20, 2]])
+    state = object.__new__(EplbState)
+    state.model_states = {"model": ms}
+    state.expert_load_window_size = 3
+    state.expert_load_window_step = 0
+    state.expert_rearrangement_step = 0
+    state.expert_rearrangement_step_interval = 100
+    state.should_record_tensor = None
+    state._should_record_current_step = lambda **kwargs: True
+    state._allreduce_list = lambda values: values
+    state.rearrange_event = MagicMock()
+
+    def demand():
+        state.is_async = True
+        state.rearrange()
+        return ms.eplb_stats.global_expert_load_window
+
+    old_demand = demand().clone()
+    mapping = torch.tensor([[1, 0], [1, 0]])
+    if per_layer:
+        _commit_eplb_maps_for_layer(ms, mapping[0], 0)
+    else:
+        _commit_eplb_maps(ms, mapping)
+    torch.testing.assert_close(demand(), old_demand)
+    state.is_async = False
+    state.step(is_dummy=True)
+    assert ms.expert_load_samples == 0
+
+    for sample in range(1, 6):
+        state.is_async = False
+        ms.expert_load_pass.copy_(torch.tensor([[2, 20], [4, 40]]))
+        state.step()
+        if per_layer and sample == 2:
+            _commit_eplb_maps_for_layer(ms, mapping[1], 1)
+        if sample == 2:
+            # Reinstalling an unchanged mapping must not postpone fresh statistics.
+            if per_layer:
+                _commit_eplb_maps_for_layer(ms, mapping[0], 0)
+            else:
+                _commit_eplb_maps(ms, mapping)
+        # Do not refresh the cached second layer before its delayed installation.
+        if per_layer and sample == 1:
+            continue
+        expected = old_demand.clone()
+        if sample >= 3:
+            expected[0] = torch.tensor([60, 6])
+        if sample >= (5 if per_layer else 3):
+            expected[1] = torch.tensor([120, 12])
+        torch.testing.assert_close(demand(), expected)

@@ -183,6 +183,8 @@ class EplbModelState:
     See:
     https://github.com/vllm-project/vllm/pull/22167#pullrequestreview-3086143856
     """
+    expert_load_valid_after: torch.Tensor
+    """Recorded-sample count at which each layer's history matches its mapping."""
     model_name: str
     model: MixtureOfExperts
     expert_buffer: list[torch.Tensor]
@@ -227,6 +229,10 @@ class EplbModelState:
     pointers remain stable across CUDA-graph replays.  The router kernel
     indexes this list with ``dbo_current_ubatch_id()``.
     """
+    expert_load_samples: int = 0
+    """Number of samples recorded, independent of the sliding-window cursor."""
+    last_expert_load: torch.Tensor | None = None
+    """Last valid global logical-expert totals, used until fresh history is ready."""
 
 
 class EplbState:
@@ -499,6 +505,9 @@ class EplbState:
             expert_load_pass=expert_load_pass,
             expert_load_pass_buffer=expert_load_pass_buffer,
             expert_load_window=expert_load_window,
+            expert_load_valid_after=torch.zeros(
+                model.num_moe_layers, dtype=torch.int64, device=self.device
+            ),
             model_name=model_config.model,
             model=model,
             expert_buffer=expert_buffer,
@@ -638,6 +647,7 @@ class EplbState:
                         self.expert_load_window_step
                     ].copy_(eplb_model_state.expert_load_pass)
                     eplb_model_state.expert_load_pass.zero_()
+                    eplb_model_state.expert_load_samples += 1
 
             if should_record:
                 self.expert_load_window_step += 1
@@ -797,7 +807,24 @@ class EplbState:
             )
 
             global_expert_load_window = logical_expert_load_window[..., :-1].sum(dim=0)
-            global_expert_load_windows.append(global_expert_load_window)
+            invalid_history = (
+                (
+                    eplb_model_state.expert_load_samples
+                    < eplb_model_state.expert_load_valid_after
+                )
+                .to(global_expert_load_window.dtype)
+                .unsqueeze(-1)
+            )
+            # Contribute the already-global snapshot once, including on scale-up
+            # when new ranks have no snapshot. Any invalid rank triggers fallback.
+            saved_load = eplb_model_state.last_expert_load
+            if ep_rank != 0 or saved_load is None:
+                saved_load = torch.zeros_like(global_expert_load_window)
+            global_expert_load_windows.append(
+                torch.cat(
+                    (global_expert_load_window, saved_load, invalid_history), dim=-1
+                )
+            )
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
 
@@ -835,6 +862,15 @@ class EplbState:
         for eplb_model_state, global_expert_load_window in zip(
             self.model_states.values(), global_expert_load_windows
         ):
+            num_logical_experts = eplb_model_state.model.num_logical_experts
+            fresh_load, saved_load, invalid_history = global_expert_load_window.split(
+                [num_logical_experts, num_logical_experts, 1], dim=-1
+            )
+            global_expert_load_window = torch.where(
+                invalid_history == 0, fresh_load, saved_load
+            )
+            if not is_profile:
+                eplb_model_state.last_expert_load = global_expert_load_window
             if not self.is_async or is_profile:
                 # Get new expert mappings for the model. The policy runs on the
                 # host, so the load window and current map have to come back.
@@ -1341,6 +1377,7 @@ def _commit_eplb_maps_for_layer(
         f"Current number of physical experts: {dst.shape[0]}. New number of physical "
         f"experts {src.shape[0]}."
     )
+    old_mapping = dst.clone()
     if PIN_MEMORY and src.is_cpu:
         src = src.new_empty(src.shape, pin_memory=True).copy_(src)
     dst.copy_(src, non_blocking=True)
@@ -1358,6 +1395,11 @@ def _commit_eplb_maps_for_layer(
         src = src.pin_memory()
     dst.copy_(src, non_blocking=True)
 
+    model_state.expert_load_valid_after[layer].masked_fill_(
+        (old_mapping != model_state.physical_to_logical_map[layer]).any(),
+        model_state.expert_load_samples + model_state.expert_load_window.shape[0],
+    )
+
 
 def _commit_eplb_maps(
     model_state: EplbModelState,
@@ -1370,6 +1412,7 @@ def _commit_eplb_maps(
     # Commit physical_to_logical_map
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map
+    old_mapping = dst.clone() if src.shape == dst.shape else None
 
     if PIN_MEMORY and src.is_cpu:
         src = src.new_empty(src.shape, pin_memory=True).copy_(src)
@@ -1380,6 +1423,16 @@ def _commit_eplb_maps(
         assert dst.shape == src.shape
         model_state.physical_to_logical_map = dst
     dst.copy_(src, non_blocking=True)
+
+    valid_after = (
+        model_state.expert_load_samples + model_state.expert_load_window.shape[0]
+    )
+    if old_mapping is None:
+        model_state.expert_load_valid_after.fill_(valid_after)
+    else:
+        model_state.expert_load_valid_after.masked_fill_(
+            (old_mapping != dst).any(dim=-1), valid_after
+        )
 
     num_logical_experts = model_state.logical_to_physical_map.shape[1]
     new_logical, new_replica_count = compute_logical_maps(src, num_logical_experts)
