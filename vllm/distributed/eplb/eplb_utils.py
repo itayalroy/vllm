@@ -10,8 +10,82 @@ import torch
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit(do_not_specialize=["expert_load_window_step"])
+def _record_expert_load(
+    expert_load_pass,
+    physical_to_logical_map,
+    expert_load_window,
+    expert_load_window_step,
+    MAX_PHYSICAL_EXPERTS: tl.constexpr,
+    NUM_LOGICAL_EXPERTS: tl.constexpr,
+):
+    """Each program records one layer's logical loads and clears its physical counts."""
+    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(MAX_PHYSICAL_EXPERTS)
+    expert_slots = tl.arange(0, BLOCK_SIZE)
+    layer = tl.program_id(0)
+    num_layers = tl.num_programs(0)
+
+    # Clear this layer's counts in the window slot being overwritten.
+    # expert_load_window shape: [window_size, num_layers, entries_per_layer].
+    entries_per_layer = NUM_LOGICAL_EXPERTS + 1
+    step_offset = expert_load_window_step.to(tl.int64) * num_layers * entries_per_layer
+    layer_offset = layer.to(tl.int64) * entries_per_layer
+    layer_window_ptr = expert_load_window + step_offset + layer_offset
+    tl.store(layer_window_ptr + expert_slots, 0, expert_slots < NUM_LOGICAL_EXPERTS)
+    tl.debug_barrier()
+
+    physical_expert_offsets = layer * MAX_PHYSICAL_EXPERTS + expert_slots
+    valid_slot = expert_slots < MAX_PHYSICAL_EXPERTS
+    logical_expert_ids = tl.load(
+        physical_to_logical_map + physical_expert_offsets, mask=valid_slot, other=-1
+    )
+    expert_load = tl.load(
+        expert_load_pass + physical_expert_offsets, mask=valid_slot, other=0
+    )
+
+    tl.atomic_add(
+        layer_window_ptr + logical_expert_ids,
+        expert_load,
+        mask=logical_expert_ids >= 0,
+        sem="relaxed",
+    )
+    tl.store(expert_load_pass + physical_expert_offsets, 0, mask=valid_slot)
+
+
+def record_expert_load(
+    expert_load_pass: torch.Tensor,
+    physical_to_logical_map: torch.Tensor,
+    expert_load_window: torch.Tensor,
+    expert_load_window_step: int,
+) -> None:
+    """Record logical loads and clear full-capacity physical counters.
+
+    Inactive slots in the full-capacity mapping must contain -1.
+    """
+    num_logical_experts = expert_load_window.shape[-1] - 1
+    if not expert_load_pass.is_cuda:
+        expert_load_window[expert_load_window_step].zero_().scatter_add_(
+            -1,
+            physical_to_logical_map.masked_fill(
+                physical_to_logical_map < 0, num_logical_experts
+            ),
+            expert_load_pass,
+        )
+        expert_load_pass.zero_()
+        return
+    _record_expert_load[(expert_load_pass.shape[0],)](
+        expert_load_pass,
+        physical_to_logical_map,
+        expert_load_window,
+        expert_load_window_step,
+        expert_load_pass.stride(0),
+        num_logical_experts,
+    )
 
 
 @contextlib.contextmanager
