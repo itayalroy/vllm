@@ -30,6 +30,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         numel,
         num_active_experts,
         HAS_NUM_UNPADDED: tl.constexpr,
+        RECORD_PHYSICAL: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -82,15 +83,15 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             is_unpadded = offs < num_unpadded_tokens * num_active_experts
         else:
             is_unpadded = True
-        valid = (
-            mask
-            & record_enabled
-            & is_unpadded
-            & (physical_id >= 0)
-            & (physical_id < out_size)
-        )
-        safe_physical_id = tl.where(physical_id >= 0, physical_id, 0)
-        tl.atomic_add(out_ptr + safe_physical_id, 1, mask=valid)
+        valid = mask & record_enabled & is_unpadded & valid_expert & (physical_id >= 0)
+        tl.atomic_add(out_ptr + safe_expert_id, 1, mask=valid)
+        if RECORD_PHYSICAL:
+            safe_physical_id = tl.maximum(physical_id, 0)
+            tl.atomic_add(
+                out_ptr + num_logical_experts + safe_physical_id,
+                1,
+                mask=valid & (physical_id < out_size - num_logical_experts),
+            )
 
     def _eplb_map_and_record_triton(
         topk_ids: torch.Tensor,
@@ -122,6 +123,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             numel,
             num_active_experts,
             HAS_NUM_UNPADDED=num_unpadded_tokens is not None,
+            RECORD_PHYSICAL=expert_load_view.numel() > logical_replica_count.numel(),
             BLOCK_SIZE=256,
         )
         return out_flat.reshape(topk_ids.shape)
@@ -134,6 +136,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Record logical counts, with optional physical counts in the buffer suffix."""
         # Fused triton implementation: mapping + optional recording in one kernel.
         return _eplb_map_and_record_triton(
             topk_ids=topk_ids,

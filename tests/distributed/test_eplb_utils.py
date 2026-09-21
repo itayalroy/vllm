@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.distributed.eplb.eplb_state import (
+    EplbState,
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
@@ -157,3 +158,40 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
+
+
+@pytest.mark.parametrize("log_balancedness", [False, True])
+def test_logical_load_history_survives_scaling(log_balancedness):
+    """Keep logical history and graph-facing counters stable across repeated scales."""
+    storage = torch.full((2, 6), -1, dtype=torch.long)
+    storage[:, :3] = torch.tensor([[0, 1, 2], [2, 0, 1]])
+    ms = _make_model_state(
+        storage[:, :3], torch.full((2, 3, 4), -1), torch.ones((2, 3)), storage
+    )
+    ms.model.num_logical_experts = 3
+    ms.model.num_physical_experts = 3
+    ms.expert_load_pass_buffer = torch.zeros((2, 3 + (6 if log_balancedness else 0)))
+    ms.expert_load_pass = ms.expert_load_pass_buffer[:, :3]
+    ms.expert_load_window = torch.arange(18).reshape(3, 2, 3)
+    history = ms.expert_load_window.clone()
+    counts_ptr = ms.expert_load_pass.data_ptr()
+    history_ptr = ms.expert_load_window.data_ptr()
+    config = MagicMock()
+    config.compute_hash.return_value = "model"
+    state = object.__new__(EplbState)
+    state.model_states = {"model": ms}
+    state._allreduce_list = lambda values: values
+    for new_size in (6, 3, 6):
+        ms.expert_load_pass_buffer.fill_(7)
+        state.reconfigure_physical_expert_slots(config, new_size)
+        ms.model.num_physical_experts = new_size
+        mapping = (torch.arange(new_size) % 3).expand(2, -1)
+        _commit_eplb_maps(ms, mapping)
+        torch.testing.assert_close(ms.expert_load_window, history)
+        assert ms.expert_load_window.data_ptr() == history_ptr
+        assert ms.expert_load_pass.data_ptr() == counts_ptr
+        assert (ms.expert_load_pass == 7).all()
+        if log_balancedness:
+            expected = torch.full((2, new_size), 7.0)
+            expected[:, 3:] = 0
+            torch.testing.assert_close(state._sync_load_pass()[0], expected)

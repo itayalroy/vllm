@@ -718,6 +718,16 @@ def test_custom(
 # ---------------------------------------------------------------------------
 
 
+def _assert_eplb_load(load, ids, num_logical, physical_load):
+    logical_load = torch.bincount(ids.flatten().long(), minlength=num_logical).to(load)
+    torch.testing.assert_close(load[:num_logical], logical_load)
+    if load.numel() > num_logical:
+        torch.testing.assert_close(
+            load[num_logical:], torch.tensor(physical_load, device=load.device).to(load)
+        )
+
+
+@pytest.mark.parametrize("record_physical", [True, False])
 @pytest.mark.parametrize("record_enabled", [True, False])
 @pytest.mark.parametrize(
     "l2p_map, replica_count, num_physical, topk_ids, expected_out, expected_load",
@@ -755,6 +765,7 @@ def test_custom(
     ],
 )
 def test_eplb_map_no_redundancy(
+    record_physical,
     record_enabled,
     l2p_map,
     replica_count,
@@ -765,7 +776,8 @@ def test_eplb_map_no_redundancy(
 ):
     l2p = torch.tensor(l2p_map, dtype=torch.int64, device="cuda")
     rc = torch.tensor(replica_count, dtype=torch.int64, device="cuda")
-    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    num_counters = rc.numel() + (num_physical if record_physical else 0)
+    load = torch.zeros(num_counters, dtype=torch.int32, device="cuda")
     rec = torch.tensor(record_enabled, dtype=torch.bool, device="cuda")
     ids = torch.tensor(topk_ids, dtype=torch.int32, device="cuda")
 
@@ -781,8 +793,7 @@ def test_eplb_map_no_redundancy(
     torch.testing.assert_close(out, exp_out)
 
     if record_enabled:
-        exp_load = torch.tensor(expected_load, dtype=torch.int32, device="cuda")
-        torch.testing.assert_close(load, exp_load)
+        _assert_eplb_load(load, ids, rc.numel(), expected_load)
     else:
         assert load.sum().item() == 0
 
@@ -815,7 +826,7 @@ def test_eplb_map_hot_expert_replica_balance(top_k, R):
     )
     topk_ids[:, 0] = 0
 
-    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    load = torch.zeros(num_logical + num_physical, dtype=torch.int32, device="cuda")
     rec = torch.tensor(True, dtype=torch.bool, device="cuda")
 
     eplb_map_to_physical_and_record(
@@ -826,13 +837,18 @@ def test_eplb_map_hot_expert_replica_balance(top_k, R):
         record_enabled=rec,
     )
 
-    hot_load = load[:R].float()
+    torch.testing.assert_close(
+        load[:num_logical],
+        torch.bincount(topk_ids.flatten().long(), minlength=num_logical).to(load),
+    )
+    hot_load = load[num_logical : num_logical + R].float()
     max_mean = (hot_load.max() / hot_load.mean()).item()
     assert max_mean < 1.15, (
         f"Hot expert replicas uneven: {hot_load.tolist()}, max/mean={max_mean:.3f}"
     )
 
 
+@pytest.mark.parametrize("record_physical", [True, False])
 @pytest.mark.parametrize("record_enabled", [True, False])
 @pytest.mark.parametrize(
     "l2p_map, replica_count, num_physical, topk_ids, expected_out, expected_load",
@@ -880,6 +896,7 @@ def test_eplb_map_hot_expert_replica_balance(top_k, R):
     ],
 )
 def test_eplb_map_with_redundancy(
+    record_physical,
     record_enabled,
     l2p_map,
     replica_count,
@@ -890,7 +907,8 @@ def test_eplb_map_with_redundancy(
 ):
     l2p = torch.tensor(l2p_map, dtype=torch.int64, device="cuda")
     rc = torch.tensor(replica_count, dtype=torch.int64, device="cuda")
-    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    num_counters = rc.numel() + (num_physical if record_physical else 0)
+    load = torch.zeros(num_counters, dtype=torch.int32, device="cuda")
     rec = torch.tensor(record_enabled, dtype=torch.bool, device="cuda")
     ids = torch.tensor(topk_ids, dtype=torch.int32, device="cuda")
 
@@ -906,12 +924,12 @@ def test_eplb_map_with_redundancy(
     torch.testing.assert_close(out, exp_out)
 
     if record_enabled:
-        exp_load = torch.tensor(expected_load, dtype=torch.int32, device="cuda")
-        torch.testing.assert_close(load, exp_load)
+        _assert_eplb_load(load, ids, rc.numel(), expected_load)
     else:
         assert load.sum().item() == 0
 
 
+@pytest.mark.parametrize("record_physical", [True, False])
 @pytest.mark.parametrize(
     "l2p_map, replica_count, num_physical, topk_ids, "
     "num_unpadded, expected_out, expected_load",
@@ -941,6 +959,7 @@ def test_eplb_map_with_redundancy(
     ],
 )
 def test_eplb_map_num_unpadded_tokens(
+    record_physical,
     l2p_map,
     replica_count,
     num_physical,
@@ -951,7 +970,8 @@ def test_eplb_map_num_unpadded_tokens(
 ):
     l2p = torch.tensor(l2p_map, dtype=torch.int64, device="cuda")
     rc = torch.tensor(replica_count, dtype=torch.int64, device="cuda")
-    load = torch.zeros(num_physical, dtype=torch.int32, device="cuda")
+    num_counters = rc.numel() + (num_physical if record_physical else 0)
+    load = torch.zeros(num_counters, dtype=torch.int32, device="cuda")
     rec = torch.tensor(True, dtype=torch.bool, device="cuda")
     ids = torch.tensor(topk_ids, dtype=torch.int32, device="cuda")
     num_unpadded_t = (
@@ -972,5 +992,27 @@ def test_eplb_map_num_unpadded_tokens(
     exp_out = torch.tensor(expected_out, dtype=out.dtype, device="cuda")
     torch.testing.assert_close(out, exp_out)
 
-    exp_load = torch.tensor(expected_load, dtype=torch.int32, device="cuda")
-    torch.testing.assert_close(load, exp_load)
+    _assert_eplb_load(load, ids[:num_unpadded], rc.numel(), expected_load)
+
+
+@pytest.mark.parametrize("record_physical", [True, False])
+def test_eplb_logical_load_survives_mapping_changes(record_physical):
+    """Keep logical counts stable across mapping changes and ignore invalid routes."""
+    l2p = torch.tensor([[0, 3], [1, -1], [-1, -1]], device="cuda")
+    replicas = torch.tensor([2, 1, 0], device="cuda")
+    ids = torch.tensor([[0, 1], [2, -1], [3, 0]], dtype=torch.int32, device="cuda")
+    load = torch.zeros(
+        3 + (8 if record_physical else 0), dtype=torch.int32, device="cuda"
+    )
+    record = torch.tensor(True, device="cuda")
+    unpadded = torch.tensor(2, device="cuda")
+    for first_slot in (0, 6, 3):
+        l2p[0, 0] = first_slot
+        eplb_map_to_physical_and_record(ids, load, l2p, replicas, record, unpadded)
+    torch.testing.assert_close(
+        load[:3], torch.tensor([3, 3, 0], device="cuda").to(load)
+    )
+    if record_physical:
+        torch.testing.assert_close(
+            load[3:], torch.tensor([1, 3, 0, 1, 0, 0, 1, 0], device="cuda").to(load)
+        )
