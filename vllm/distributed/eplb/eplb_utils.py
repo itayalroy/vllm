@@ -10,8 +10,26 @@ import torch
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+@torch.compile(
+    fullgraph=True,
+    dynamic=True,
+    backend=current_platform.simple_compile_backend,
+)
+def record_expert_load(
+    load_pass: torch.Tensor,
+    mapping: torch.Tensor,
+    history_row: torch.Tensor,
+) -> None:
+    """Record logical expert loads and clear the physical counters."""
+    history_row.zero_().scatter_add_(
+        -1, mapping.masked_fill(mapping < 0, history_row.shape[-1] - 1), load_pass
+    )
+    load_pass.zero_()
 
 
 @contextlib.contextmanager

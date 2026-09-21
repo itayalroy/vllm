@@ -10,6 +10,28 @@ from vllm.distributed.eplb.eplb_state import (
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
+from vllm.distributed.eplb.eplb_utils import record_expert_load
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_record_expert_load_survives_reshuffle(device):
+    """Moving experts or adding replicas must not change previous logical counts."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("Requires CUDA")
+    window = torch.full((3, 1, 3), -1, dtype=torch.int32, device=device)
+    samples = [
+        ([0, 1], [100, 10]),
+        ([1, 0], [20, 200]),
+        ([1, 0, 0, -1], [30, 100, 200, 999]),
+    ]
+    for row, (mapping, counts) in zip(window, samples):
+        mapping = torch.tensor([mapping], device=device)
+        counts = torch.tensor([counts], dtype=torch.int32, device=device)
+        record_expert_load(counts, mapping, row)
+        assert not counts.any().item()
+    torch.testing.assert_close(
+        window[..., :-1].sum(0), torch.tensor([[600, 60]], device=device)
+    )
 
 
 def _make_model_state(
