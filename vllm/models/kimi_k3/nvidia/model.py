@@ -503,6 +503,7 @@ class KimiK3MegaMoEExperts(DeepseekV4MegaMoEExperts):
             topk_ids = eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
                 expert_load_view=eplb_state.expert_load_view,
+                physical_expert_load_view=eplb_state.physical_expert_load_view,
                 logical_to_physical_map=eplb_state.logical_to_physical_map,
                 logical_replica_count=eplb_state.logical_replica_count,
                 record_enabled=eplb_state.should_record_tensor,

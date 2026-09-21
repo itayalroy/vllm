@@ -512,12 +512,14 @@ class ElasticEPScalingExecutor:
         model.expert_weights = []
         with set_current_vllm_config(self.worker.vllm_config):
             model.set_eplb_state(
-                eplb_model_state.expert_load_pass_buffer,
+                eplb_model_state.expert_load_pass,
                 eplb_model_state.logical_to_physical_map,
                 eplb_model_state.logical_replica_count,
             )
             eplb_state._propagate_shared_tensors(
-                model, eplb_model_state.num_unpadded_tokens_tensors
+                model,
+                eplb_model_state.num_unpadded_tokens_tensors,
+                eplb_model_state.physical_expert_load_pass,
             )
             model.update_physical_experts_metadata(
                 num_physical_experts=num_physical_experts,

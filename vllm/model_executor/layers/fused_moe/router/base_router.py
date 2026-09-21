@@ -22,6 +22,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         logical_to_physical_ptr,
         out_ids_ptr,
         out_ptr,
+        physical_load_ptr,
         record_enabled_ptr,
         num_unpadded_tokens_ptr,
         num_logical_experts,
@@ -30,6 +31,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         numel,
         num_active_experts,
         HAS_NUM_UNPADDED: tl.constexpr,
+        RECORD_PHYSICAL: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -82,15 +84,15 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             is_unpadded = offs < num_unpadded_tokens * num_active_experts
         else:
             is_unpadded = True
-        valid = (
-            mask
-            & record_enabled
-            & is_unpadded
-            & (physical_id >= 0)
-            & (physical_id < out_size)
-        )
-        safe_physical_id = tl.where(physical_id >= 0, physical_id, 0)
-        tl.atomic_add(out_ptr + safe_physical_id, 1, mask=valid)
+        valid = mask & record_enabled & is_unpadded & valid_expert & (physical_id >= 0)
+        tl.atomic_add(out_ptr + safe_expert_id, 1, mask=valid)
+        if RECORD_PHYSICAL:
+            safe_physical_id = tl.maximum(physical_id, 0)
+            tl.atomic_add(
+                physical_load_ptr + safe_physical_id,
+                1,
+                mask=valid & (physical_id < out_size),
+            )
 
     def _eplb_map_and_record_triton(
         topk_ids: torch.Tensor,
@@ -99,6 +101,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         expert_load_view: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None,
+        physical_expert_load_view: torch.Tensor | None,
     ) -> torch.Tensor:
         topk_ids_in = topk_ids.contiguous().to(dtype=torch.int32)
         numel = topk_ids_in.numel()
@@ -114,14 +117,18 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             logical_to_physical_map.contiguous(),
             out_flat,
             expert_load_view,
+            physical_expert_load_view,
             record_enabled,
             num_unpadded_tokens,
             logical_replica_count.shape[0],
             logical_to_physical_map.shape[1],
-            expert_load_view.shape[0],
+            physical_expert_load_view.numel()
+            if physical_expert_load_view is not None
+            else 0,
             numel,
             num_active_experts,
             HAS_NUM_UNPADDED=num_unpadded_tokens is not None,
+            RECORD_PHYSICAL=physical_expert_load_view is not None,
             BLOCK_SIZE=256,
         )
         return out_flat.reshape(topk_ids.shape)
@@ -133,6 +140,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        physical_expert_load_view: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Fused triton implementation: mapping + optional recording in one kernel.
         return _eplb_map_and_record_triton(
@@ -142,6 +150,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             expert_load_view=expert_load_view,
             record_enabled=record_enabled,
             num_unpadded_tokens=num_unpadded_tokens,
+            physical_expert_load_view=physical_expert_load_view,
         )
 else:
 
@@ -152,6 +161,7 @@ else:
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        physical_expert_load_view: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return topk_ids
 
@@ -214,6 +224,7 @@ class BaseRouter(FusedMoERouter):
                 logical_to_physical_map=eplb_state.logical_to_physical_map,
                 logical_replica_count=eplb_state.logical_replica_count,
                 expert_load_view=eplb_state.expert_load_view,
+                physical_expert_load_view=eplb_state.physical_expert_load_view,
                 record_enabled=eplb_state.should_record_tensor,
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
                     dbo_current_ubatch_id()

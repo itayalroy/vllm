@@ -771,7 +771,8 @@ def test_eplb_map_no_redundancy(
 
     out = eplb_map_to_physical_and_record(
         topk_ids=ids,
-        expert_load_view=load,
+        expert_load_view=torch.zeros_like(rc, dtype=torch.int32),
+        physical_expert_load_view=load,
         logical_to_physical_map=l2p,
         logical_replica_count=rc,
         record_enabled=rec,
@@ -820,7 +821,8 @@ def test_eplb_map_hot_expert_replica_balance(top_k, R):
 
     eplb_map_to_physical_and_record(
         topk_ids=topk_ids,
-        expert_load_view=load,
+        expert_load_view=torch.zeros_like(rc, dtype=torch.int32),
+        physical_expert_load_view=load,
         logical_to_physical_map=l2p,
         logical_replica_count=rc,
         record_enabled=rec,
@@ -896,7 +898,8 @@ def test_eplb_map_with_redundancy(
 
     out = eplb_map_to_physical_and_record(
         topk_ids=ids,
-        expert_load_view=load,
+        expert_load_view=torch.zeros_like(rc, dtype=torch.int32),
+        physical_expert_load_view=load,
         logical_to_physical_map=l2p,
         logical_replica_count=rc,
         record_enabled=rec,
@@ -962,7 +965,8 @@ def test_eplb_map_num_unpadded_tokens(
 
     out = eplb_map_to_physical_and_record(
         topk_ids=ids,
-        expert_load_view=load,
+        expert_load_view=torch.zeros_like(rc, dtype=torch.int32),
+        physical_expert_load_view=load,
         logical_to_physical_map=l2p,
         logical_replica_count=rc,
         record_enabled=rec,
@@ -974,3 +978,27 @@ def test_eplb_map_num_unpadded_tokens(
 
     exp_load = torch.tensor(expected_load, dtype=torch.int32, device="cuda")
     torch.testing.assert_close(load, exp_load)
+
+
+@pytest.mark.parametrize("record_physical", [True, False])
+def test_eplb_logical_load_survives_mapping_changes(record_physical):
+    """Swapping physical slots must not swap the recorded logical demand."""
+    mapping = torch.tensor([[0], [1]], device="cuda")
+    replicas = torch.ones(2, dtype=torch.int64, device="cuda")
+    ids = torch.tensor([[0], [0], [1]], dtype=torch.int32, device="cuda")
+    load = torch.zeros(2, dtype=torch.int32, device="cuda")
+    physical_load = torch.zeros_like(load) if record_physical else None
+    record = torch.tensor(True, device="cuda")
+    for _ in range(2):
+        eplb_map_to_physical_and_record(
+            ids,
+            load,
+            mapping,
+            replicas,
+            record,
+            physical_expert_load_view=physical_load,
+        )
+        mapping.copy_(mapping.flip(0))
+    torch.testing.assert_close(load, load.new_tensor([4, 2]))
+    if physical_load is not None:
+        torch.testing.assert_close(physical_load, physical_load.new_tensor([3, 3]))
