@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.distributed.eplb.eplb_state import (
+    EplbState,
     _commit_eplb_maps,
     _commit_eplb_maps_for_layer,
 )
@@ -157,3 +158,56 @@ def test_commit_eplb_maps_for_layer():
 
     # Layer 1 untouched
     assert torch.equal(model_state.physical_to_logical_map[1], original_phy2log[1])
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize("scale_before_first_reshuffle", [False, True])
+def test_elastic_ep_reuses_last_load(
+    monkeypatch, is_async, scale_before_first_reshuffle
+):
+    """EEP reuses logical demand; ordinary EPLB continues sampling fresh history."""
+    module = "vllm.distributed.eplb.eplb_state"
+    group = MagicMock()
+    group.device_group.rank.return_value = 0
+    group.device_group.size.return_value = 1
+    group.broadcast_object.side_effect = lambda value: value
+    monkeypatch.setattr(f"{module}.get_ep_group", lambda: group)
+    monkeypatch.setattr(f"{module}.get_node_count", lambda: 1)
+    monkeypatch.setattr(f"{module}.rearrange_expert_weights_inplace", MagicMock())
+    monkeypatch.setattr(f"{module}.current_platform.is_rocm", lambda: False)
+    event = MagicMock()
+    event.elapsed_time.return_value = 0.0
+    monkeypatch.setattr(torch, "Event", lambda **kwargs: event)
+    ms = _make_model_state(
+        torch.tensor([[0, 1]]), torch.tensor([[[0], [1]]]), torch.ones((1, 2))
+    )
+    ms.model.num_logical_experts = 2
+    ms.model.num_physical_experts = 2
+    ms.model.num_expert_groups = 1
+    ms.model.num_moe_layers = 1
+    ms.expert_load_window = torch.tensor([[[10, 1]]] * 3, dtype=torch.int32)
+    ms.last_expert_load = None
+    state = object.__new__(EplbState)
+    state.model_states = {"model": ms}
+    state.expert_load_window_size = 3
+    state.is_async = is_async
+    state.rearrange_event = event
+    state._allreduce_list = lambda values: values
+    state.policy = MagicMock()
+    state.policy.rebalance_experts.side_effect = lambda *args: args[-1].clone()
+
+    state.rearrange(reuse_load=scale_before_first_reshuffle)
+    torch.testing.assert_close(ms.last_expert_load, torch.tensor([[30, 3]]))
+    ms.physical_to_logical_map.copy_(torch.tensor([[1, 0]]))
+    for _ in range(2):
+        state.rearrange(reuse_load=True)
+        torch.testing.assert_close(ms.last_expert_load, torch.tensor([[30, 3]]))
+
+    ms.expert_load_window[:] = torch.tensor([2, 20])
+    state.rearrange()
+    torch.testing.assert_close(ms.last_expert_load, torch.tensor([[60, 6]]))
+    ms.expert_load_window.zero_()
+    state.rearrange(reuse_load=True)
+    torch.testing.assert_close(ms.last_expert_load, torch.tensor([[60, 6]]))
+    state.rearrange(is_profile=True)
+    torch.testing.assert_close(ms.last_expert_load, torch.tensor([[60, 6]]))

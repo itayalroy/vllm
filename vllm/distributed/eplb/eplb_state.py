@@ -227,6 +227,8 @@ class EplbModelState:
     pointers remain stable across CUDA-graph replays.  The router kernel
     indexes this list with ``dbo_current_ubatch_id()``.
     """
+    last_expert_load: torch.Tensor | None = None
+    """Global logical-expert totals from the last reshuffle, reused by Elastic EP."""
 
 
 class EplbState:
@@ -744,6 +746,7 @@ class EplbState:
         self,
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
+        reuse_load: bool = False,
     ) -> torch.Tensor | None:
         """Rearrange the experts according to the current load.
 
@@ -753,6 +756,8 @@ class EplbState:
                 no memory movement will be performed. Default is False.
             rank_mapping (dict[int, int] | None): The rank mapping
                 when scaling is done in EEP.
+            reuse_load: Reuse the last reshuffle's logical-expert totals instead
+                of history that may still describe the previous placement.
 
         """
         ep_group = get_ep_group().device_group
@@ -775,6 +780,21 @@ class EplbState:
         # Map the physical expert load to global logical experts
         global_expert_load_windows = []
         for eplb_model_state in self.model_states.values():
+            saved_load = eplb_model_state.last_expert_load
+            if reuse_load and get_ep_group().broadcast_object(saved_load is not None):
+                # New ranks have no snapshot. Contribute the already-global
+                # totals once, then distribute them through the load all-reduce.
+                model = eplb_model_state.model
+                load = torch.zeros(
+                    (model.num_moe_layers, model.num_logical_experts),
+                    dtype=torch.int64,
+                    device=eplb_model_state.expert_load_window.device,
+                )
+                if is_main_rank:
+                    assert saved_load is not None
+                    load.copy_(saved_load)
+                global_expert_load_windows.append(load)
+                continue
             expert_load_window = eplb_model_state.expert_load_window
             physical_to_logical = eplb_model_state.physical_to_logical_map
             invalid_idx = eplb_model_state.model.num_logical_experts
@@ -835,6 +855,8 @@ class EplbState:
         for eplb_model_state, global_expert_load_window in zip(
             self.model_states.values(), global_expert_load_windows
         ):
+            if not is_profile:
+                eplb_model_state.last_expert_load = global_expert_load_window
             if not self.is_async or is_profile:
                 # Get new expert mappings for the model. The policy runs on the
                 # host, so the load window and current map have to come back.
