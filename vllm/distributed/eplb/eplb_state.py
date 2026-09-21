@@ -52,7 +52,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
-from .eplb_utils import CpuGpuEvent
+from .eplb_utils import CpuGpuEvent, record_expert_load
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     AsyncEplbLayerResult,
@@ -171,17 +171,11 @@ class EplbModelState:
     """Maximum-capacity buffer backing ``expert_load_pass``."""
     expert_load_window: torch.Tensor
     """
-    A sliding window of expert load.
+    A sliding window indexed by logical expert, so samples remain valid when
+    physical slots are reassigned. The final column collects inactive slots
+    and is excluded from rebalancing.
 
-    Shape: (window_size, num_moe_layers, num_physical_experts)
-
-    NOTE: The expert_load_view now records load for all physical experts
-    rather than just local experts. This ensures consistent load statistics
-    across different dispatch methods (naive all-to-all, DeepEP).
-    The recorded load will be multiplied by dp_size when using naive all-to-all
-    due to each DP rank contributing the same token set to the calculation.
-    See:
-    https://github.com/vllm-project/vllm/pull/22167#pullrequestreview-3086143856
+    Shape: (window_size, num_moe_layers, num_logical_experts + 1)
     """
     model_name: str
     model: MixtureOfExperts
@@ -449,10 +443,14 @@ class EplbState:
             (
                 self.expert_load_window_size,
                 model.num_moe_layers,
-                model.num_physical_experts,
+                model.num_logical_experts + 1,
             ),
             dtype=torch.int32,
             device=self.device,
+        )
+        # Compile recording before serving; both buffers are still empty.
+        record_expert_load(
+            expert_load_pass, physical_to_logical_map, expert_load_window, 0
         )
 
         # Set the initial progress of rearrangement to 3/4
@@ -634,10 +632,12 @@ class EplbState:
             should_record = self._should_record_current_step(log_stats=log_stats)
             for eplb_model_state in self.model_states.values():
                 if should_record:
-                    eplb_model_state.expert_load_window[
-                        self.expert_load_window_step
-                    ].copy_(eplb_model_state.expert_load_pass)
-                    eplb_model_state.expert_load_pass.zero_()
+                    record_expert_load(
+                        eplb_model_state.expert_load_pass,
+                        eplb_model_state.physical_to_logical_map,
+                        eplb_model_state.expert_load_window,
+                        self.expert_load_window_step,
+                    )
 
             if should_record:
                 self.expert_load_window_step += 1
@@ -772,31 +772,11 @@ class EplbState:
                 "(profile)" if is_profile else "",
             )
 
-        # Map the physical expert load to global logical experts
+        # Aggregate logical load recorded under each sample's expert mapping.
         global_expert_load_windows = []
         for eplb_model_state in self.model_states.values():
             expert_load_window = eplb_model_state.expert_load_window
-            physical_to_logical = eplb_model_state.physical_to_logical_map
-            invalid_idx = eplb_model_state.model.num_logical_experts
-            logical_expert_load_window = torch.zeros(
-                self.expert_load_window_size,
-                eplb_model_state.model.num_moe_layers,
-                invalid_idx + 1,
-                dtype=eplb_model_state.expert_load_window.dtype,
-                device=eplb_model_state.expert_load_window.device,
-            )
-            logical_expert_load_window.scatter_add_(
-                dim=-1,
-                index=physical_to_logical.masked_fill(
-                    physical_to_logical < 0, invalid_idx
-                )
-                .unsqueeze(0)
-                .expand_as(expert_load_window)
-                .long(),
-                src=expert_load_window,
-            )
-
-            global_expert_load_window = logical_expert_load_window[..., :-1].sum(dim=0)
+            global_expert_load_window = expert_load_window[..., :-1].sum(dim=0)
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
@@ -1135,11 +1115,6 @@ class EplbState:
             :, :num_physical_experts
         ]
         model_state.expert_load_pass = expert_load_pass_buffer[:, :num_physical_experts]
-
-        pad_size = num_physical_experts - model_state.expert_load_window.shape[-1]
-        model_state.expert_load_window = torch.nn.functional.pad(
-            model_state.expert_load_window, (0, pad_size)
-        )
 
     def create_communicator(
         self, model_config: ModelConfig, group_coordinator: GroupCoordinator

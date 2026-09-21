@@ -10,8 +10,61 @@ import torch
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit(
+    do_not_specialize=["num_physical_experts"],
+    do_not_specialize_on_alignment=["window"],
+)
+def _record_expert_load(
+    load_pass,
+    mapping,
+    window,
+    num_physical_experts,
+    PHYSICAL_STRIDE: tl.constexpr,
+    LAYER_STRIDE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    layer = tl.program_id(1).to(tl.int64)
+    slots = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    valid = slots < num_physical_experts
+    offsets = layer * PHYSICAL_STRIDE + slots
+    experts = tl.load(mapping + offsets, valid, other=-1)
+    counts = tl.load(load_pass + offsets, valid, other=0)
+    experts = tl.where(experts < 0, LAYER_STRIDE - 1, experts)
+    tl.atomic_add(window + layer * LAYER_STRIDE + experts, counts, valid, sem="relaxed")
+    tl.store(load_pass + offsets, 0, valid)
+
+
+def record_expert_load(
+    load_pass: torch.Tensor,
+    mapping: torch.Tensor,
+    window: torch.Tensor,
+    window_step: int,
+) -> None:
+    """Record logical counts and clear counters; physical row strides must match."""
+    window = window[window_step]
+    window.zero_()
+    if not load_pass.is_cuda:
+        window.scatter_add_(
+            -1, mapping.masked_fill(mapping < 0, window.shape[-1] - 1), load_pass
+        )
+        load_pass.zero_()
+        return
+    block_size = 256
+    grid = (triton.cdiv(load_pass.shape[1], block_size), load_pass.shape[0])
+    _record_expert_load[grid](
+        load_pass,
+        mapping,
+        window,
+        load_pass.shape[1],
+        load_pass.stride(0),
+        window.stride(0),
+        block_size,
+    )
 
 
 @contextlib.contextmanager
