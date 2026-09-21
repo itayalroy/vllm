@@ -10,8 +10,61 @@ import torch
 
 from vllm.config import ParallelConfig
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit(do_not_specialize=["num_physical_experts", "window_step"])
+def _record_expert_load(
+    load_pass,
+    mapping,
+    window,
+    num_physical_experts,
+    window_step,
+    PHYSICAL_STRIDE: tl.constexpr,
+    LAYER_STRIDE: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(LAYER_STRIDE)
+    layer = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    row = window_step.to(tl.int64) * tl.num_programs(0) + layer
+    output = window + row * LAYER_STRIDE
+    tl.store(output + offsets, 0, offsets < LAYER_STRIDE)
+    # Each block owns one layer. Finish clearing before any atomic additions.
+    tl.debug_barrier()
+    for start in range(0, num_physical_experts, BLOCK_SIZE):
+        slots = start + offsets
+        valid = slots < num_physical_experts
+        experts = tl.load(mapping + layer * PHYSICAL_STRIDE + slots, valid, other=-1)
+        counts = tl.load(load_pass + layer * PHYSICAL_STRIDE + slots, valid, other=0)
+        experts = tl.where(experts < 0, LAYER_STRIDE - 1, experts)
+        tl.atomic_add(output + experts, counts, valid, sem="relaxed")
+        tl.store(load_pass + layer * PHYSICAL_STRIDE + slots, 0, valid)
+
+
+def record_expert_load(
+    load_pass: torch.Tensor,
+    mapping: torch.Tensor,
+    window: torch.Tensor,
+    window_step: int,
+) -> None:
+    """Record logical counts and clear counters; physical row strides must match."""
+    if not load_pass.is_cuda:
+        window[window_step].zero_().scatter_add_(
+            -1, mapping.masked_fill(mapping < 0, window.shape[-1] - 1), load_pass
+        )
+        load_pass.zero_()
+        return
+    _record_expert_load[(load_pass.shape[0],)](
+        load_pass,
+        mapping,
+        window,
+        load_pass.shape[1],
+        window_step,
+        load_pass.stride(0),
+        window.stride(1),
+    )
 
 
 @contextlib.contextmanager
