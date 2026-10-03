@@ -1218,7 +1218,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             ),
             requires_grad=False,
         )
-        self.hc_attn_fn_broadcast: torch.Tensor | None = None
+        self.register_buffer("hc_attn_fn_broadcast", None)
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
